@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  reliakit_core:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - reliakit_memory:/app/memory_data
+    command: python tk_meta_loop.py
+
+  ollama:
+    image: ollama/ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+
+  dashboard:
+    build:
+      context: ./modules/dashboard
+    container_name: reliakit_dashboard
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./reliakit:/app/reliakit
+      - ./generated_configs:/app/generated_configs
+    depends_on:
+      - reliakit_core
+
+volumes:
+  reliakit_memory:

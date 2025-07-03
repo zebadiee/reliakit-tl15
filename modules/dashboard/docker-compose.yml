@@ -1,0 +1,10 @@
+version: '3.8'
+services:
+  editor:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./vault:/app/vault
+    environment:
+      - PYTHONUNBUFFERED=1

@@ -1,0 +1,44 @@
+<!-- File: modules/dashboard/templates/index.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>ReliaKit Dashboard</title>
+    <style>
+        body { font-family: sans-serif; background: #1a1a1a; color: #e0e0e0; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { border: 1px solid #444; padding: 8px; text-align: left; }
+        th { background: #333; }
+        .status-SUCCESS { color: #4CAF50; }
+        .status-FALLBACK { color: #FFC107; }
+        .status-ERROR { color: #F44336; }
+    </style>
+</head>
+<body>
+    <h1>ReliaKit Agent Activity</h1>
+    <table>
+        <thead>
+            <tr>
+                <th>Timestamp</th>
+                <th>Agent</th>
+                <th>Model Used</th>
+                <th>Status</th>
+                <th>Prompt</th>
+                <th>Response</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for action in actions %}
+            <tr>
+                <td>{{ action['timestamp'] }}</td>
+                <td>{{ action['agent_name'] }}</td>
+                <td>{{ action['model_used'] }}</td>
+                <td class="status-{{ action['status'] }}">{{ action['status'] }}</td>
+                <td><pre>{{ action['prompt'] }}</pre></td>
+                <td><pre>{{ action['response'] }}</pre></td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</body>
+</html>
