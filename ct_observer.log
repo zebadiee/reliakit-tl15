@@ -1,0 +1,3 @@
+[CT-OBSERVER] online
+{"observed_at": "2025-12-13T17:55:55.638533", "event": {"id": 1, "ts": "2025-12-13T11:56:25.158247", "agent_id": "", "type": "cli", "payload": "hello invictus", "hash": "", "prev_hash": ""}}
+{"observed_at": "2025-12-13T17:55:55.648690", "event": {"id": 2, "ts": "2025-12-13T15:50:38.443671", "agent_id": "agent-test-01", "type": "status", "payload": "agent escalation verified", "hash": "2b0ec4b02728f5a6b9fbc2b7bf35469ad7e7f9f8dc7d63fd56463cab0885affb", "prev_hash": ""}}

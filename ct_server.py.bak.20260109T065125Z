@@ -1,0 +1,497 @@
+#!/usr/bin/env python3
+import os
+import sqlite3
+import hashlib
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel
+
+# =========================================================
+# Core identity
+# =========================================================
+
+NODE_ID = os.environ.get("CT_NODE_ID", "invictus")
+NODE_ROLE = os.environ.get("CT_NODE_ROLE", "authoritative")
+
+BASE = os.path.expanduser("~/invictus")
+DATA_DIR = os.environ.get("CT_DATA", f"{BASE}/data")
+DB_PATH = os.path.join(DATA_DIR, "ct_memory.db")
+
+# Network / auth hardening toggles (safe defaults)
+REQUIRE_TAILSCALE = os.environ.get("CT_REQUIRE_TAILSCALE", "0") == "1"
+REQUIRE_SIGNATURES = os.environ.get("CT_REQUIRE_SIGS", "0") == "1"
+
+app = FastAPI(title="CT Invictus Control Plane")
+
+# =========================================================
+# Optional crypto (Ed25519 verification)
+# =========================================================
+
+_CRYPTO_OK = False
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    from cryptography.hazmat.primitives import serialization
+    _CRYPTO_OK = True
+except Exception:
+    _CRYPTO_OK = False
+
+
+def utcnow_iso() -> str:
+    # timezone-aware UTC timestamp (avoids deprecated utcnow)
+    return datetime.now(timezone.utc).isoformat()
+
+
+def db():
+    # one connection per request/operation; keep it simple and predictable
+    return sqlite3.connect(DB_PATH)
+
+
+def hash_chain(prev: str, ts: str, agent: str, etype: str, payload: str) -> str:
+    h = hashlib.sha256()
+    h.update((prev or "").encode())
+    h.update(ts.encode())
+    h.update(agent.encode())
+    h.update(etype.encode())
+    h.update(payload.encode())
+    return h.hexdigest()
+
+
+def init_db():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    d = sqlite3.connect(DB_PATH)
+    c = d.cursor()
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS node_identity (
+        node_id TEXT PRIMARY KEY,
+        role TEXT NOT NULL,
+        locked INTEGER NOT NULL,
+        locked_at TEXT NOT NULL
+    )
+    """)
+
+    # NOTE: Your DB may already have an agents schema. We do not drop/alter.
+    # We only create if absent. If schema differs, use explicit column INSERTs below.
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS agents (
+        agent_id TEXT PRIMARY KEY,
+        role TEXT NOT NULL,
+        revoked INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+    )
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        type TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        prev_hash TEXT,
+        hash TEXT NOT NULL
+    )
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS revoked_certs (
+        fingerprint TEXT PRIMARY KEY,
+        revoked_at TEXT NOT NULL
+    )
+    """)
+
+    # Lease contracts (Step-6)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS leases (
+        lease_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        issued_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        state TEXT NOT NULL, -- ACTIVE, COMPLETED, FAILED, EXPIRED
+        hash TEXT NOT NULL
+    )
+    """)
+
+    # Agent public keys (Ed25519)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS agent_keys (
+        agent_id TEXT PRIMARY KEY,
+        pubkey TEXT NOT NULL,
+        added_at TEXT NOT NULL
+    )
+    """)
+
+    c.execute("SELECT COUNT(*) FROM node_identity")
+    if c.fetchone()[0] == 0:
+        c.execute(
+            "INSERT INTO node_identity VALUES (?, ?, ?, ?)",
+            (NODE_ID, NODE_ROLE, 1, utcnow_iso())
+        )
+
+    d.commit()
+    d.close()
+
+
+init_db()
+
+# =========================================================
+# Request hardening (optional)
+# =========================================================
+
+def _is_tailscale_ip(ip: str) -> bool:
+    # IPv4 tailscale range is 100.64.0.0/10, commonly seen as 100.x.x.x
+    # We'll accept anything starting with "100." plus the local loopback for local testing.
+    if ip in ("127.0.0.1", "::1"):
+        return True
+    return ip.startswith("100.")
+
+
+@app.middleware("http")
+async def tailscale_only(request: Request, call_next):
+    if REQUIRE_TAILSCALE:
+        client_ip = request.client.host if request.client else ""
+        if not _is_tailscale_ip(client_ip):
+            return HTTPException(status_code=403, detail="tailscale-only")
+    return await call_next(request)
+
+
+# =========================================================
+# Models
+# =========================================================
+
+class LeaseRequest(BaseModel):
+    agent_id: str
+    task_id: str
+    scope: str
+    nonce: Optional[str] = None
+    signature: Optional[str] = None  # hex or base64; exo_runner decides. We treat as base64 by default.
+
+
+class LeaseComplete(BaseModel):
+    agent_id: str
+    lease_id: str
+    success: bool = True
+    receipt: Optional[str] = None
+
+
+# =========================================================
+# Identity & health
+# =========================================================
+
+@app.get("/health")
+def health():
+    return {"status": "online", "node": NODE_ID}
+
+
+@app.get("/identity")
+def identity():
+    d = db()
+    c = d.cursor()
+    c.execute("SELECT node_id, role, locked, locked_at FROM node_identity LIMIT 1")
+    row = c.fetchone()
+    d.close()
+    return {
+        "node_id": row[0],
+        "role": row[1],
+        "locked": bool(row[2]),
+        "locked_at": row[3],
+    }
+
+
+# =========================================================
+# Agent lifecycle
+# =========================================================
+
+@app.post("/agent/hello")
+def agent_hello(body: dict):
+    agent_id = body.get("agent_id")
+    if not agent_id:
+        raise HTTPException(400, "agent_id required")
+
+    d = db()
+    c = d.cursor()
+
+    # Use explicit columns to avoid schema drift (fixes “5 columns but 4 values” cases).
+    c.execute(
+        "INSERT OR IGNORE INTO agents (agent_id, role, revoked, created_at) VALUES (?, ?, ?, ?)",
+        (agent_id, "readonly", 0, utcnow_iso())
+    )
+    d.commit()
+    d.close()
+
+    return {
+        "node": NODE_ID,
+        "role": NODE_ROLE,
+        "agent_role": "readonly",
+        "locked": True
+    }
+
+
+@app.post("/agent/escalate")
+def agent_escalate(body: dict):
+    agent_id = body.get("agent_id")
+    role = body.get("role")
+    if role not in ("readonly", "writer", "executor"):
+        raise HTTPException(400, "invalid role")
+
+    d = db()
+    c = d.cursor()
+    c.execute(
+        "UPDATE agents SET role=? WHERE agent_id=? AND revoked=0",
+        (role, agent_id)
+    )
+    d.commit()
+    d.close()
+
+    return {"ok": True, "agent_id": agent_id, "role": role}
+
+
+@app.post("/agent/revoke")
+def agent_revoke(body: dict):
+    agent_id = body.get("agent_id")
+    d = db()
+    c = d.cursor()
+    c.execute("UPDATE agents SET revoked=1 WHERE agent_id=?", (agent_id,))
+    d.commit()
+    d.close()
+    return {"ok": True, "revoked": agent_id}
+
+
+# =========================================================
+# Admin key registry (Step-6 crypto anchor)
+# =========================================================
+
+def load_agent_pubkey(agent_id: str) -> Optional[str]:
+    d = db()
+    c = d.cursor()
+    c.execute("SELECT pubkey FROM agent_keys WHERE agent_id=?", (agent_id,))
+    row = c.fetchone()
+    d.close()
+    return row[0] if row else None
+
+
+@app.post("/admin/register_key")
+def register_key(body: dict):
+    agent_id = body.get("agent_id")
+    pubkey = body.get("pubkey")  # expected: OpenSSH "ssh-ed25519 AAAA... comment"
+    if not agent_id or not pubkey:
+        raise HTTPException(400, "agent_id and pubkey required")
+
+    d = db()
+    c = d.cursor()
+    c.execute(
+        "INSERT OR REPLACE INTO agent_keys (agent_id, pubkey, added_at) VALUES (?, ?, ?)",
+        (agent_id, pubkey.strip(), utcnow_iso())
+    )
+    d.commit()
+    d.close()
+    return {"ok": True, "agent_id": agent_id}
+
+
+def _verify_ed25519(agent_id: str, message: str, signature_b64: str) -> bool:
+    if not REQUIRE_SIGNATURES:
+        return True
+    if not _CRYPTO_OK:
+        raise HTTPException(status_code=503, detail="crypto backend not installed (cryptography)")
+
+    pub = load_agent_pubkey(agent_id)
+    if not pub:
+        raise HTTPException(status_code=403, detail="no public key registered for agent")
+
+    # Parse OpenSSH pubkey line: "ssh-ed25519 AAAAC3... comment"
+    parts = pub.split()
+    if len(parts) < 2 or parts[0] != "ssh-ed25519":
+        raise HTTPException(status_code=400, detail="invalid pubkey format")
+
+    import base64
+    keydata = base64.b64decode(parts[1].encode())
+
+    # OpenSSH wire format: string "ssh-ed25519", string key_bytes
+    # We minimally parse it.
+    def read_u32(b, off):
+        return int.from_bytes(b[off:off+4], "big"), off+4
+
+    def read_str(b, off):
+        ln, off = read_u32(b, off)
+        return b[off:off+ln], off+ln
+
+    off = 0
+    t, off = read_str(keydata, off)
+    if t != b"ssh-ed25519":
+        raise HTTPException(status_code=400, detail="pubkey type mismatch")
+    k, off = read_str(keydata, off)
+
+    pk = Ed25519PublicKey.from_public_bytes(k)
+    sig = base64.b64decode(signature_b64.encode())
+    try:
+        pk.verify(sig, message.encode())
+        return True
+    except Exception:
+        return False
+
+
+# =========================================================
+# Event ingestion (tamper-evident)
+# =========================================================
+
+@app.post("/event")
+def log_event(body: dict):
+    agent_id = body.get("agent_id")
+    etype = body.get("type")
+    payload = body.get("payload")
+
+    if not agent_id or not etype or payload is None or payload == "":
+        raise HTTPException(status_code=400, detail="agent_id, type, payload required")
+
+    d = db()
+    c = d.cursor()
+
+    c.execute("SELECT role, revoked FROM agents WHERE agent_id=?", (agent_id,))
+    row = c.fetchone()
+    if row is None:
+        d.close()
+        raise HTTPException(status_code=403, detail="unknown agent")
+
+    role, revoked = row
+    if revoked:
+        d.close()
+        raise HTTPException(status_code=403, detail="agent revoked")
+
+    if role not in ("writer", "executor"):
+        d.close()
+        raise HTTPException(status_code=403, detail="insufficient role")
+
+    c.execute("SELECT hash FROM events ORDER BY id DESC LIMIT 1")
+    prev = c.fetchone()
+    prev_hash = prev[0] if prev else ""
+
+    ts = utcnow_iso()
+    h = hash_chain(prev_hash, ts, agent_id, etype, str(payload))
+
+    c.execute(
+        "INSERT INTO events (ts, agent_id, type, payload, prev_hash, hash) VALUES (?, ?, ?, ?, ?, ?)",
+        (ts, agent_id, etype, str(payload), prev_hash, h)
+    )
+
+    d.commit()
+    d.close()
+
+    return {"ok": True, "hash": h}
+
+
+# =========================================================
+# Lease contracts (Step-6)
+# =========================================================
+
+def _agent_role(agent_id: str) -> str:
+    d = db()
+    c = d.cursor()
+    c.execute("SELECT role, revoked FROM agents WHERE agent_id=?", (agent_id,))
+    row = c.fetchone()
+    d.close()
+    if not row:
+        raise HTTPException(status_code=403, detail="unknown agent")
+    role, revoked = row
+    if revoked:
+        raise HTTPException(status_code=403, detail="agent revoked")
+    return role
+
+
+@app.post("/lease/request")
+def lease_request(req: LeaseRequest):
+    # 1) Governance check
+    role = _agent_role(req.agent_id)
+    if role != "executor":
+        raise HTTPException(status_code=403, detail="executor role required")
+
+    # 2) Optional signature verification (OFF by default)
+    # Canonical message binds request parameters + nonce.
+    nonce = req.nonce or ""
+    msg = f"{req.agent_id}|{req.task_id}|{req.scope}|{nonce}"
+    if REQUIRE_SIGNATURES:
+        if not req.signature:
+            raise HTTPException(status_code=403, detail="signature required")
+        if not _verify_ed25519(req.agent_id, msg, req.signature):
+            raise HTTPException(status_code=403, detail="bad signature")
+
+    # 3) Issue lease
+    lease_id = str(uuid.uuid4())
+    issued_at = utcnow_iso()
+    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat()
+
+    lease_hash = hashlib.sha256(
+        f"{lease_id}|{req.task_id}|{req.agent_id}|{req.scope}|{issued_at}|{expires_at}".encode()
+    ).hexdigest()
+
+    d = db()
+    c = d.cursor()
+    c.execute(
+        "INSERT INTO leases (lease_id, task_id, agent_id, scope, issued_at, expires_at, state, hash) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (lease_id, req.task_id, req.agent_id, req.scope, issued_at, expires_at, "ACTIVE", lease_hash)
+    )
+    d.commit()
+    d.close()
+
+    return {
+        "status": "GRANTED",
+        "lease_id": lease_id,
+        "expires_at": expires_at,
+        "hash": lease_hash
+    }
+
+
+@app.post("/lease/complete")
+def lease_complete(res: LeaseComplete):
+    # basic sanity
+    role = _agent_role(res.agent_id)
+    if role != "executor":
+        raise HTTPException(status_code=403, detail="executor role required")
+
+    d = db()
+    c = d.cursor()
+    c.execute("SELECT agent_id, expires_at, state FROM leases WHERE lease_id=?", (res.lease_id,))
+    row = c.fetchone()
+    if not row:
+        d.close()
+        raise HTTPException(status_code=404, detail="lease not found")
+
+    lease_agent, expires_at, state = row
+    if lease_agent != res.agent_id:
+        d.close()
+        raise HTTPException(status_code=403, detail="lease not owned by agent")
+
+    if state != "ACTIVE":
+        d.close()
+        raise HTTPException(status_code=400, detail=f"cannot close lease in state {state}")
+
+    # expiry check
+    try:
+        exp = datetime.fromisoformat(expires_at)
+    except Exception:
+        exp = datetime.now(timezone.utc)  # fail closed-ish; treat as expired
+    if datetime.now(timezone.utc) > exp:
+        c.execute("UPDATE leases SET state='EXPIRED' WHERE lease_id=?", (res.lease_id,))
+        d.commit()
+        d.close()
+        raise HTTPException(status_code=408, detail="lease expired")
+
+    final_state = "COMPLETED" if res.success else "FAILED"
+    c.execute("UPDATE leases SET state=? WHERE lease_id=?", (final_state, res.lease_id))
+    d.commit()
+    d.close()
+
+    # log closure into tamper-evident chain
+    payload = f"Lease {res.lease_id} {final_state}"
+    if res.receipt:
+        payload += f" | receipt={res.receipt}"
+
+    # Event logging requires writer/executor: agent is executor, so OK
+    log_event({"agent_id": res.agent_id, "type": "LEASE_CLOSED", "payload": payload})
+
+    return {"status": "CLOSED", "final_state": final_state}

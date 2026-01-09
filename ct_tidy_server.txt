@@ -1,0 +1,26 @@
+CT TIDY REPORT — server
+Generated: Thu Jan  8 07:21:44 AM GMT 2026
+
+
+==== CT LAW (should live in ~/.obsidian/CT) ====
+
+==== CT RUNTIME (should live in ~/.config/ct or ~/ct-runtime) ====
+/home/zebadiee/bin/ct_govern
+/home/zebadiee/.config/ct/status.json
+/home/zebadiee/.config/ct/targets.tsv
+
+==== OBSIDIAN HUMAN (markdown, vaults) ====
+
+==== EXPERIMENTAL / SANDBOX (exo, docker, tests) ====
+
+==== POTENTIAL DRIFT (CT-related outside canonical locations) ====
+/home/zebadiee/bin/ct_govern
+/home/zebadiee/ct_observer.py
+/home/zebadiee/ct_notifier.py
+/home/zebadiee/invictus/ct/ct_violations.py
+/home/zebadiee/invictus/ct/ct_observer.py
+/home/zebadiee/invictus/ct/ct_server.py
+/home/zebadiee/invictus/data/ct_memory.db
+/home/zebadiee/invictus/logs/ct_observer.log
+/home/zebadiee/invictus/logs/ct_observer.err
+

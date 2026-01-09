@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+
+import os
+import sqlite3
+import hashlib
+import uuid
+from datetime import datetime, timedelta
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+# =========================================================
+# Core identity
+# =========================================================
+
+NODE_ID = "invictus"
+NODE_ROLE = "authoritative"
+
+BASE = os.path.expanduser("~/invictus")
+DATA_DIR = os.environ.get("CT_DATA", f"{BASE}/data")
+DB_PATH = os.path.join(DATA_DIR, "ct_memory.db")
+
+app = FastAPI(title="CT Governance Control Plane")
+
+# =========================================================
+# Database bootstrap
+# =========================================================
+
+def init_db():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    d = sqlite3.connect(DB_PATH)
+    c = d.cursor()
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS node_identity (
+        node_id TEXT PRIMARY KEY,
+        role TEXT NOT NULL,
+        locked INTEGER NOT NULL,
+        locked_at TEXT NOT NULL
+    )
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS agents (
+        agent_id TEXT PRIMARY KEY,
+        role TEXT NOT NULL,
+        revoked INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+    )
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        type TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        prev_hash TEXT,
+        hash TEXT NOT NULL
+    )
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS leases (
+        lease_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        issued_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        state TEXT NOT NULL,
+        hash TEXT NOT NULL
+    )
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS revoked_certs (
+        fingerprint TEXT PRIMARY KEY,
+        revoked_at TEXT NOT NULL
+    )
+    """)
+
+    c.execute("SELECT COUNT(*) FROM node_identity")
+    if c.fetchone()[0] == 0:
+        c.execute(
+            "INSERT INTO node_identity VALUES (?, ?, ?, ?)",
+            (NODE_ID, NODE_ROLE, 1, datetime.utcnow().isoformat())
+        )
+
+    d.commit()
+    d.close()
+
+def db():
+    return sqlite3.connect(DB_PATH)
+
+def hash_chain(prev, ts, agent, etype, payload):
+    h = hashlib.sha256()
+    h.update((prev or "").encode())
+    h.update(ts.encode())
+    h.update(agent.encode())
+    h.update(etype.encode())
+    h.update(payload.encode())
+    return h.hexdigest()
+
+init_db()
+
+# =========================================================
+# Health & identity
+# =========================================================
+
+@app.get("/health")
+def health():
+    return {"status": "online", "node": NODE_ID}
+
+@app.get("/identity")
+def identity():
+    d = db()
+    c = d.cursor()
+    c.execute("SELECT node_id, role, locked, locked_at FROM node_identity LIMIT 1")
+    row = c.fetchone()
+    d.close()
+    return {
+        "node_id": row[0],
+        "role": row[1],
+        "locked": bool(row[2]),
+        "locked_at": row[3],
+    }
+
+# =========================================================
+# Agent lifecycle
+# =========================================================
+
+@app.post("/agent/hello")
+def agent_hello(body: dict):
+    agent_id = body.get("agent_id")
+    if not agent_id:
+        raise HTTPException(400, "agent_id required")
+
+    d = db()
+    c = d.cursor()
+    c.execute(
+        "INSERT OR IGNORE INTO agents VALUES (?, ?, ?, ?)",
+        (agent_id, "readonly", 0, datetime.utcnow().isoformat())
+    )
+    d.commit()
+    d.close()
+
+    return {
+        "node": NODE_ID,
+        "role": NODE_ROLE,
+        "agent_role": "readonly",
+        "locked": True
+    }
+
+@app.post("/agent/escalate")
+def agent_escalate(body: dict):
+    agent_id = body.get("agent_id")
+    role = body.get("role")
+
+    if role not in ("readonly", "writer", "executor"):
+        raise HTTPException(400, "invalid role")
+
+    d = db()
+    c = d.cursor()
+    c.execute(
+        "UPDATE agents SET role=? WHERE agent_id=? AND revoked=0",
+        (role, agent_id)
+    )
+    d.commit()
+    d.close()
+
+    return {"ok": True, "agent_id": agent_id, "role": role}
+
+@app.post("/agent/revoke")
+def agent_revoke(body: dict):
+    agent_id = body.get("agent_id")
+
+    d = db()
+    c = d.cursor()
+    c.execute("UPDATE agents SET revoked=1 WHERE agent_id=?", (agent_id,))
+    d.commit()
+    d.close()
+
+    return {"ok": True, "revoked": agent_id}
+
+# =========================================================
+# Event ingestion (tamper-evident)
+# =========================================================
+
+@app.post("/event")
+def log_event(body: dict):
+    agent_id = body.get("agent_id")
+    etype = body.get("type")
+    payload = body.get("payload")
+
+    if not agent_id or not etype or not payload:
+        raise HTTPException(400, "agent_id, type, payload required")
+
+    d = db()
+    c = d.cursor()
+
+    c.execute("SELECT role, revoked FROM agents WHERE agent_id=?", (agent_id,))
+    row = c.fetchone()
+    if row is None:
+        d.close()
+        raise HTTPException(403, "unknown agent")
+
+    role, revoked = row
+    if revoked or role not in ("writer", "executor"):
+        d.close()
+        raise HTTPException(403, "insufficient role")
+
+    c.execute("SELECT hash FROM events ORDER BY id DESC LIMIT 1")
+    prev = c.fetchone()
+    prev_hash = prev[0] if prev else ""
+
+    ts = datetime.utcnow().isoformat()
+    h = hash_chain(prev_hash, ts, agent_id, etype, payload)
+
+    c.execute(
+        "INSERT INTO events (ts, agent_id, type, payload, prev_hash, hash) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (ts, agent_id, etype, payload, prev_hash, h)
+    )
+
+    d.commit()
+    d.close()
+
+    return {"ok": True, "hash": h}
+
+# =========================================================
+# Lease governance (Step-6)
+# =========================================================
+
+class LeaseRequest(BaseModel):
+    agent_id: str
+    task_id: str
+    scope: str
+
+class LeaseResult(BaseModel):
+    lease_id: str
+    agent_id: str
+    success: bool
+
+@app.post("/lease/request")
+def request_lease(req: LeaseRequest):
+    d = db()
+    c = d.cursor()
+
+    c.execute("SELECT role, revoked FROM agents WHERE agent_id=?", (req.agent_id,))
+    row = c.fetchone()
+    if not row or row[0] != "executor" or row[1]:
+        d.close()
+        raise HTTPException(403, "executor role required")
+
+    lease_id = str(uuid.uuid4())
+    issued_at = datetime.utcnow()
+    expires_at = issued_at + timedelta(minutes=15)
+
+    lease_data = f"{lease_id}{req.task_id}{req.agent_id}{expires_at.isoformat()}"
+    lease_hash = hashlib.sha256(lease_data.encode()).hexdigest()
+
+    c.execute("""
+        INSERT INTO leases
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        lease_id,
+        req.task_id,
+        req.agent_id,
+        req.scope,
+        issued_at.isoformat(),
+        expires_at.isoformat(),
+        "ACTIVE",
+        lease_hash
+    ))
+
+    d.commit()
+    d.close()
+
+    return {
+        "status": "GRANTED",
+        "lease_id": lease_id,
+        "expires_at": expires_at.isoformat(),
+        "hash": lease_hash
+    }
+
+@app.post("/lease/complete")
+def complete_lease(res: LeaseResult):
+    d = db()
+    c = d.cursor()
+
+    c.execute("""
+        SELECT expires_at, state
+        FROM leases
+        WHERE lease_id=? AND agent_id=?
+    """, (res.lease_id, res.agent_id))
+
+    row = c.fetchone()
+    if not row:
+        d.close()
+        raise HTTPException(404, "lease not found")
+
+    expires_at, state = row
+    if state != "ACTIVE":
+        d.close()
+        raise HTTPException(400, f"invalid state {state}")
+
+    if datetime.utcnow() > datetime.fromisoformat(expires_at):
+        c.execute("UPDATE leases SET state='EXPIRED' WHERE lease_id=?", (res.lease_id,))
+        d.commit()
+        d.close()
+        raise HTTPException(408, "lease expired")
+
+    final = "COMPLETED" if res.success else "FAILED"
+    c.execute("UPDATE leases SET state=? WHERE lease_id=?", (final, res.lease_id))
+    d.commit()
+    d.close()
+
+    log_event({
+        "agent_id": res.agent_id,
+        "type": "LEASE_CLOSED",
+        "payload": f"Lease {res.lease_id} {final}"
+    })
+
+    return {"status": "CLOSED", "final_state": final}
+
+# =========================================================
+# Lease hygiene (manual)
+# =========================================================
+
+def expire_leases():
+    d = db()
+    c = d.cursor()
+    now = datetime.utcnow().isoformat()
+
+    c.execute("""
+        SELECT lease_id, agent_id
+        FROM leases
+        WHERE state='ACTIVE' AND expires_at < ?
+    """, (now,))
+
+    rows = c.fetchall()
+
+    for lease_id, agent_id in rows:
+        c.execute("UPDATE leases SET state='EXPIRED' WHERE lease_id=?", (lease_id,))
+        log_event({
+            "agent_id": agent_id,
+            "type": "LEASE_EXPIRED",
+            "payload": f"Lease {lease_id} expired"
+        })
+
+    d.commit()
+    d.close()
+    return len(rows)
+
+@app.post("/lease/expire")
+def manual_expire():
+    return {"expired": expire_leases()}

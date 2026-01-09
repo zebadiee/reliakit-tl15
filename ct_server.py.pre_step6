@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+import os
+import sqlite3
+import hashlib
+from datetime import datetime
+from fastapi import FastAPI, HTTPException
+
+# =========================================================
+# Core identity
+# =========================================================
+
+NODE_ID = "invictus"
+NODE_ROLE = "authoritative"
+
+BASE = os.path.expanduser("~/invictus")
+DATA_DIR = os.environ.get("CT_DATA", f"{BASE}/data")
+DB_PATH = os.path.join(DATA_DIR, "ct_memory.db")
+
+app = FastAPI(title="CT Invictus Control Plane")
+
+# =========================================================
+# Database bootstrap
+# =========================================================
+
+def init_db():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    db = sqlite3.connect(DB_PATH)
+    c = db.cursor()
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS node_identity (
+        node_id TEXT PRIMARY KEY,
+        role TEXT NOT NULL,
+        locked INTEGER NOT NULL,
+        locked_at TEXT NOT NULL
+    )
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS agents (
+        agent_id TEXT PRIMARY KEY,
+        role TEXT NOT NULL,
+        revoked INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+    )
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        type TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        prev_hash TEXT,
+        hash TEXT NOT NULL
+    )
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS revoked_certs (
+        fingerprint TEXT PRIMARY KEY,
+        revoked_at TEXT NOT NULL
+    )
+    """)
+
+    c.execute("SELECT COUNT(*) FROM node_identity")
+    if c.fetchone()[0] == 0:
+        c.execute(
+            "INSERT INTO node_identity VALUES (?, ?, ?, ?)",
+            (NODE_ID, NODE_ROLE, 1, datetime.utcnow().isoformat())
+        )
+
+    db.commit()
+    db.close()
+
+def db():
+    return sqlite3.connect(DB_PATH)
+
+def hash_chain(prev, ts, agent, etype, payload):
+    h = hashlib.sha256()
+    h.update((prev or "").encode())
+    h.update(ts.encode())
+    h.update(agent.encode())
+    h.update(etype.encode())
+    h.update(payload.encode())
+    return h.hexdigest()
+
+init_db()
+
+# =========================================================
+# Identity & health
+# =========================================================
+
+@app.get("/health")
+def health():
+    return {"status": "online", "node": NODE_ID}
+
+@app.get("/identity")
+def identity():
+    d = db()
+    c = d.cursor()
+    c.execute("SELECT node_id, role, locked, locked_at FROM node_identity LIMIT 1")
+    row = c.fetchone()
+    d.close()
+    return {
+        "node_id": row[0],
+        "role": row[1],
+        "locked": bool(row[2]),
+        "locked_at": row[3],
+    }
+
+# =========================================================
+# Agent lifecycle
+# =========================================================
+
+@app.post("/agent/hello")
+def agent_hello(body: dict):
+    agent_id = body.get("agent_id")
+    if not agent_id:
+        raise HTTPException(400, "agent_id required")
+
+    d = db()
+    c = d.cursor()
+    c.execute(
+        "INSERT OR IGNORE INTO agents VALUES (?, ?, ?, ?)",
+        (agent_id, "readonly", 0, datetime.utcnow().isoformat())
+    )
+    d.commit()
+    d.close()
+
+    return {
+        "node": NODE_ID,
+        "role": NODE_ROLE,
+        "agent_role": "readonly",
+        "locked": True
+    }
+
+@app.post("/agent/escalate")
+def agent_escalate(body: dict):
+    agent_id = body.get("agent_id")
+    role = body.get("role")
+    if role not in ("readonly", "writer", "executor"):
+        raise HTTPException(400, "invalid role")
+
+    d = db()
+    c = d.cursor()
+    c.execute(
+        "UPDATE agents SET role=? WHERE agent_id=? AND revoked=0",
+        (role, agent_id)
+    )
+    d.commit()
+    d.close()
+
+    return {"ok": True, "agent_id": agent_id, "role": role}
+
+@app.post("/agent/revoke")
+def agent_revoke(body: dict):
+    agent_id = body.get("agent_id")
+    d = db()
+    c = d.cursor()
+    c.execute("UPDATE agents SET revoked=1 WHERE agent_id=?", (agent_id,))
+    d.commit()
+    d.close()
+    return {"ok": True, "revoked": agent_id}
+
+# =========================================================
+# Event ingestion (tamper-evident)
+# =========================================================
+
+@app.post("/event")
+def log_event(body: dict):
+    agent_id = body.get("agent_id")
+    etype = body.get("type")
+    payload = body.get("payload")
+
+    if not agent_id or not etype or not payload:
+        raise HTTPException(status_code=400, detail="agent_id, type, payload required")
+
+    d = db()
+    c = d.cursor()
+
+    c.execute("SELECT role, revoked FROM agents WHERE agent_id=?", (agent_id,))
+    row = c.fetchone()
+
+    if row is None:
+        d.close()
+        raise HTTPException(status_code=403, detail="unknown agent")
+
+    role, revoked = row
+
+    if revoked:
+        d.close()
+        raise HTTPException(status_code=403, detail="agent revoked")
+
+    if role not in ("writer", "executor"):
+        d.close()
+        raise HTTPException(status_code=403, detail="insufficient role")
+
+    c.execute("SELECT hash FROM events ORDER BY id DESC LIMIT 1")
+    prev = c.fetchone()
+    prev_hash = prev[0] if prev else ""
+
+    ts = datetime.utcnow().isoformat()
+    h = hash_chain(prev_hash, ts, agent_id, etype, payload)
+
+    c.execute(
+        "INSERT INTO events (ts, agent_id, type, payload, prev_hash, hash) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (ts, agent_id, etype, payload, prev_hash, h)
+    )
+
+    d.commit()
+    d.close()
+
+    return {"ok": True, "hash": h}
+
+# =========================================================
+# Server entrypoint
+# =========================================================
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=7777)
