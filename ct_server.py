@@ -283,7 +283,9 @@ class LeaseRequest(BaseModel):
     resources: Optional[List[ResourceConstraint]] = None
     nonce: Optional[str] = None
     signature: Optional[str] = None
-
+    not_before: Optional[str] = None
+    not_after: Optional[str] = None
+    parent_lease_id: Optional[str] = None
 class LeaseComplete(BaseModel):
     agent_id: str
     lease_id: str
@@ -353,10 +355,10 @@ class PolicyUpdate(BaseModel):
 
 def require_active_lease(lease_id: str, agent_id: Optional[str] = None):
     d = db(); c = d.cursor()
-    c.execute("SELECT agent_id, expires_at, state FROM leases WHERE lease_id=?", (lease_id,))
+    c.execute("SELECT agent_id, expires_at, state, not_before, not_after FROM leases WHERE lease_id=?", (lease_id,))
     row = c.fetchone(); d.close()
     if not row: raise HTTPException(403, "invalid lease")
-    lease_agent, expires_at, state = row
+    lease_agent, expires_at, state, not_before, not_after = row
     if agent_id and lease_agent != agent_id: raise HTTPException(403, "lease not owned by agent")
     if state == "REVOKED":
         raise HTTPException(403, "lease revoked")
@@ -371,6 +373,35 @@ def require_active_lease(lease_id: str, agent_id: Optional[str] = None):
         c_upd.execute("UPDATE leases SET state='EXPIRED' WHERE lease_id=? AND state='ACTIVE'", (lease_id,))
         d_upd.commit(); d_upd.close()
         raise HTTPException(403, "lease expired")
+    
+    # Tier 13: Temporal Fence enforcement
+    now = datetime.now(timezone.utc)
+    
+    if not_before:
+        nb = datetime.fromisoformat(not_before)
+        if now < nb:
+            log_governance_event("Temporal Fence Violation", {
+                "lease_id": lease_id,
+                "agent_id": lease_agent,
+                "now": now.isoformat(),
+                "not_before": not_before,
+                "not_after": not_after,
+                "reason": "lease not yet valid"
+            })
+            raise HTTPException(403, "lease not yet valid (temporal fence)")
+    
+    if not_after:
+        na = datetime.fromisoformat(not_after)
+        if now > na:
+            log_governance_event("Temporal Fence Violation", {
+                "lease_id": lease_id,
+                "agent_id": lease_agent,
+                "now": now.isoformat(),
+                "not_before": not_before,
+                "not_after": not_after,
+                "reason": "execution window closed"
+            })
+            raise HTTPException(403, "lease execution window closed (temporal fence)")
 
 def require_capability(lease_id: str, capability: str, agent_id: Optional[str] = None):
     require_active_lease(lease_id, agent_id)
@@ -394,6 +425,56 @@ def require_admin(agent_id: str, message: str, signature: str):
         raise HTTPException(403, "admin privileges required")
     if not _verify_ed25519(agent_id, message, signature):
         raise HTTPException(403, "invalid admin signature")
+
+# =========================================================
+# Tier 14: Delegation
+# =========================================================
+
+MAX_DELEGATION_DEPTH = 2
+
+def require_valid_delegation(parent_lease_id: str, child_nb, child_na):
+    d = db(); c = d.cursor()
+    c.execute("""
+        SELECT not_before, not_after, state, delegation_depth
+        FROM leases WHERE lease_id=?
+    """, (parent_lease_id,))
+    row = c.fetchone(); d.close()
+
+    if not row:
+        raise HTTPException(403, "invalid parent lease")
+
+    p_nb, p_na, state, depth = row
+
+    if state != "ACTIVE":
+        raise HTTPException(403, "parent lease not active")
+
+    if depth >= MAX_DELEGATION_DEPTH:
+        raise HTTPException(403, "delegation depth exceeded")
+
+    nb_dt = datetime.fromisoformat(p_nb)
+    na_dt = datetime.fromisoformat(p_na)
+
+    if child_nb < nb_dt:
+        raise HTTPException(403, "child lease starts before parent")
+
+    if child_na > na_dt:
+        raise HTTPException(403, "child lease exceeds parent window")
+
+def revoke_lease_tree(lease_id: str):
+    """Revoke a lease and all its children recursively."""
+    d = db(); c = d.cursor()
+    c.execute("UPDATE leases SET state='REVOKED' WHERE lease_id=?", (lease_id,))
+    c.execute("SELECT lease_id FROM leases WHERE parent_lease_id=?", (lease_id,))
+    children = [r[0] for r in c.fetchall()]
+    d.commit(); d.close()
+    
+    log_governance_event("Delegation Cascade Revoked", {
+        "root_lease": lease_id,
+        "children_revoked": len(children)
+    })
+    
+    for child in children:
+        revoke_lease_tree(child)
 
 # =========================================================
 # Policy Evaluator
@@ -518,11 +599,20 @@ def lease_request(req: LeaseRequest):
         c.execute("SELECT 1 FROM roles_permissions WHERE role=? AND capability=?", (role, cap))
         if not c.fetchone(): d.close(); raise HTTPException(403, f"capability denied: {cap}")
 
+    # Hard guard: Tier 14 is inactive and any delegation attempt must be rejected explicitly.
+    if getattr(req, 'parent_lease_id', None):
+        log_governance_event("Delegation Attempt Rejected", {
+            "agent_id": req.agent_id,
+            "parent_lease": req.parent_lease_id
+        })
+        d.close(); raise HTTPException(403, "delegation disabled (Tier 14 inactive)")
+
     res_str = ""
     if req.resources:
         rs = sorted(req.resources, key=lambda x: f"{x.type}:{x.id}:{x.perm}")
         res_str = "|".join([f"{r.type}:{r.id}:{r.perm}" for r in rs])
     nonce = req.nonce or ""
+    
     msg = f"{req.agent_id}|{req.task_id}|{req.scope}|{res_str}|{nonce}"
     if REQUIRE_SIGNATURES:
         if not req.signature or not _verify_ed25519(req.agent_id, msg, req.signature):
@@ -531,11 +621,35 @@ def lease_request(req: LeaseRequest):
     lease_id = str(uuid.uuid4()); issued_at = utcnow_iso()
     expires_at = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat()
     lease_hash = hashlib.sha256(f"{lease_id}|{req.task_id}|{msg}".encode()).hexdigest()
-    mode = "exclusive"
-    max_consumers = 1
+    
+    # Tier 13: Temporal Fencing
+    now = datetime.now(timezone.utc)
+    nb = datetime.fromisoformat(req.not_before) if req.not_before else now
+    na = datetime.fromisoformat(req.not_after) if req.not_after else None
+    
+    if na and nb >= na:
+        d.close()
+        raise HTTPException(400, "invalid temporal fence (not_before >= not_after)")
+    
+    if na and na <= now:
+        d.close()
+        raise HTTPException(400, "temporal fence already expired")
+    
+    # Tier 14: Delegation (inactive) — guarded
+    # Reject any request attempting to use delegation while Tier 14 is locked.
+    if req.parent_lease_id:
+        log_governance_event("Delegation Attempt Rejected", {
+            "agent_id": req.agent_id,
+            "parent_lease": req.parent_lease_id
+        })
+        raise HTTPException(403, "delegation disabled (Tier 14 inactive)")
+
+    parent_id = None
+    delegation_depth = 0
+    
     c.execute("""
 INSERT INTO leases
-(lease_id, task_id, agent_id, scope, issued_at, expires_at, state, prev_hash, hash, mode, max_consumers)
+(lease_id, task_id, agent_id, scope, issued_at, expires_at, state, prev_hash, hash, not_before, not_after)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """, (
     lease_id,
@@ -547,13 +661,33 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     "ACTIVE",
     None,
     lease_hash,
-    mode,
-    max_consumers
+    nb.isoformat(),
+    na.isoformat() if na else None
 ))
+    # NOTE: Tier 14 (delegation) is inert unless parent_lease_id is supplied.
+    if req.parent_lease_id:
+        parent_id = req.parent_lease_id
+        c.execute("UPDATE leases SET parent_lease_id=?, delegation_depth=? WHERE lease_id=?", (parent_id, delegation_depth, lease_id))
     for cap in caps: c.execute("INSERT INTO lease_capabilities VALUES (?, ?)", (lease_id, cap))
     if req.resources:
         for r in req.resources: c.execute("INSERT INTO lease_resources VALUES (?, ?, ?, ?)", (lease_id, r.type, r.id, r.perm))
     d.commit(); d.close()
+    
+    log_governance_event("Temporal Fence Applied", {
+        "lease_id": lease_id,
+        "agent_id": req.agent_id,
+        "not_before": nb.isoformat(),
+        "not_after": na.isoformat() if na else None
+    })
+    
+    if req.parent_lease_id:
+        log_governance_event("Lease Delegated", {
+            "parent_lease": req.parent_lease_id,
+            "child_lease": lease_id,
+            "agent_id": req.agent_id,
+            "depth": delegation_depth
+        })
+    
     return {"status": "GRANTED", "lease_id": lease_id, "expires_at": expires_at}
 
 @app.post("/event")
@@ -671,9 +805,13 @@ def list_nodes():
     rows = c.fetchall(); d.close()
     return [{"node_id": r[0], "capabilities": r[1].split(","), "last_seen": r[2], "status": r[3], "revoked": bool(r[4])} for r in rows]
 
-# Invariant:
-# A lease in ACTIVE state may be bound to at most one node at any time.
+# Invariant (Tier 12):
+# A lease in ACTIVE state may be bound to at most one node (exclusive).
 # All execution authority flows through federation_authorize.
+#
+# Invariant (Tier 13):
+# A lease is valid only within its declared temporal window [not_before, not_after].
+# Temporal validity is enforced at request, execution, and federation layers.
 @app.post("/federation/authorize")
 def federation_authorize(req: FederationAuthorize):
     d = db(); c = d.cursor()
@@ -698,27 +836,29 @@ def federation_authorize(req: FederationAuthorize):
         if not any(a[0] == req.node_id for a in affinities):
             raise HTTPException(403, f"lease affinity mismatch")
 
-    # --- TIER 12: EXCLUSIVE BINDING ---
+    # Exclusive binding (Tier 12)
     d = db(); c = d.cursor()
     c.execute("SELECT node_id FROM lease_consumers WHERE lease_id=?", (req.lease_id,))
-    binding = c.fetchone()
-    if binding:
-        if binding[0] != req.node_id:
-            d.close()
-            log_governance_event("Lease Bind Denied", {
-                "lease_id": req.lease_id,
-                "attempted_node": req.node_id,
-                "bound_node": binding[0],
-                "agent_id": req.agent_id
-            })
-            raise HTTPException(403, f"exclusive lease already bound to node {binding[0]}")
+    consumers = [r[0] for r in c.fetchall()]
+    
+    if req.node_id in consumers:
+        # Idempotent re-authorization
+        pass
     else:
-        c.execute("INSERT INTO lease_consumers (lease_id, node_id, bound_at) VALUES (?, ?, ?)", (req.lease_id, req.node_id, utcnow_iso()))
+        if len(consumers) >= 1:
+            d.close()
+            log_governance_event("Lease Bind Denied (Exclusive)", {
+                "lease_id": req.lease_id, "attempted_node": req.node_id,
+                "bound_node": consumers[0], "agent_id": req.agent_id
+            })
+            raise HTTPException(403, f"exclusive lease already bound to node {consumers[0]}")
+
+        # Bind success
+        c.execute("INSERT INTO lease_consumers (lease_id, node_id, bound_at) VALUES (?, ?, ?)",
+                  (req.lease_id, req.node_id, utcnow_iso()))
         d.commit()
         log_governance_event("Lease Bound (Exclusive)", {
-            "lease_id": req.lease_id,
-            "node_id": req.node_id,
-            "agent_id": req.agent_id
+            "lease_id": req.lease_id, "node_id": req.node_id, "agent_id": req.agent_id
         })
     d.close()
 
@@ -813,9 +953,8 @@ def lease_revoke(req: LeaseRevoke, request: Request):
     if not row:
         d.close(); raise HTTPException(404, "lease not found")
     
-    c.execute("UPDATE leases SET state='REVOKED' WHERE lease_id=?", (req.lease_id,))
-    c.execute("DELETE FROM lease_consumers WHERE lease_id=?", (req.lease_id,))
-    d.commit(); d.close()
+    d.close()
+    revoke_lease_tree(req.lease_id)
     
     log_governance_event("Lease Revoked", {
         "lease_id": req.lease_id,
@@ -905,3 +1044,5 @@ async def node_decay_monitor():
 async def startup_event():
     asyncio.create_task(lease_sweeper())
     asyncio.create_task(node_decay_monitor())
+    # Governance note: Tier 14 is intentionally inactive/guarded until explicitly enabled.
+    log_governance_event("Tier 14 Inactive", {"status": "guarded", "note": "delegation disabled"})
