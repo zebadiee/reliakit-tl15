@@ -139,4 +139,26 @@ This document is the authoritative design & activation record for **Tier 14 — 
 - **Date**: ____________________
 - **Conditions**: tests passing; roll-back plan ready; limited canary enablement
 
+---
+
+## Review & Sign-off
+**Commit:** `6ce6fda`  
+**Tag:** `v0.13-sealed`  
+**Status:** SUBMITTED FOR REVIEW — design-only (no execution changes)
+
+**Required approvals:**
+- Owner (root-admin)
+- Security Lead (security-admin)
+- Governance Admin (admin-gov-v2)
+
+**Activation conditions (must be true before any implementation enablement):**
+- All acceptance tests implemented and passing (unit/integration/security).  
+- Governance approvals recorded in this document (signatures or explicit approvals appended).  
+- Feature flag `CT_ENABLE_DELEGATION` implemented and defaulted to `0`.  
+- Rollback and canary plan documented and tested.  
+- External audit of consent signing process completed.
+
+**Review notes:**
+- This document is submitted for formal sign-off and should be reviewed by the listed approvers. No code changes will be enabled until an explicit activation record is appended here.
+
 *End of file.*
