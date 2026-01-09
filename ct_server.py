@@ -671,6 +671,9 @@ def list_nodes():
     rows = c.fetchall(); d.close()
     return [{"node_id": r[0], "capabilities": r[1].split(","), "last_seen": r[2], "status": r[3], "revoked": bool(r[4])} for r in rows]
 
+# Invariant:
+# A lease in ACTIVE state may be bound to at most one node at any time.
+# All execution authority flows through federation_authorize.
 @app.post("/federation/authorize")
 def federation_authorize(req: FederationAuthorize):
     d = db(); c = d.cursor()
