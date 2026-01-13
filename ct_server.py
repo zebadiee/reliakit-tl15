@@ -7,12 +7,19 @@ import json
 import asyncio
 import time
 import base64
-from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
-
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from fastapi.responses import JSONResponse
+
+def is_bootstrap_request(request: Request | None = None) -> bool:
+    try:
+        if request is None:
+            return False
+        return request.headers.get("X-Bootstrap", "").lower() == "true"
+    except Exception:
+        return False
 
 # =========================================================
 # Core identity
@@ -23,7 +30,7 @@ NODE_ROLE = os.environ.get("CT_NODE_ROLE", "authoritative")
 
 BASE = os.path.expanduser("~/invictus")
 DATA_DIR = os.environ.get("CT_DATA", f"{BASE}/data")
-DB_PATH = os.path.join(DATA_DIR, "ct_memory.db")
+DB_PATH = "/home/zebadiee/invictus/data/ct_memory.db"
 
 # Network / auth hardening toggles (safe defaults)
 REQUIRE_TAILSCALE = os.environ.get("CT_REQUIRE_TAILSCALE", "0") == "1"
@@ -83,9 +90,8 @@ except Exception:
     _CRYPTO_OK = False
 
 
-def utcnow_iso() -> str:
+def utcnow_iso():
     return datetime.now(timezone.utc).isoformat()
-
 
 def db():
     return sqlite3.connect(DB_PATH)
