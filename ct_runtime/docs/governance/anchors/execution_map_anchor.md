@@ -1,0 +1,1 @@
+Execution map is authoritative at `/srv/ct/execution_map.yaml` and enforced by the runtime watcher. Update procedure: modify YAML, create an Obsidian note under `/srv/ct/obsidian/Execution/`, and document approvals in governance notes.
