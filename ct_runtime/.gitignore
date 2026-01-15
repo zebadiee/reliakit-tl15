@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+# backups
+*.bak
+*.backup
+*~
+# DB
+*.db
+# IDE
+.vscode/
+# Private review artifacts
+docs/hermes_review/private/Hermes_Private_Review_Packet.pdf
+docs/hermes_review/private/Hermes_Private_Review_Packet_combined.md
+docs/hermes_review/private/hermes_private_review_packet.md
+docs/hermes_review/private/hermes_private_review_packet.zip
+docs/hermes_review/private/private_approval_statement.txt
+docs/hermes_review/private/slack_dm_private_review.md
+docs/hermes_review/private/walkthrough_agenda.md
+# Misc
+ct_server.py.BROKEN.*
+ct_server.py.backup
+ct_server.py.bak.*

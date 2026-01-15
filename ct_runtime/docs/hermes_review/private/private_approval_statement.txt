@@ -1,9 +1,0 @@
-Private Approval Statement (for Hermes private review)
-
-Template:
-
-Reviewed ADR-009..ADR-014 for private review. No objections to proceeding to a formal PR for Phase-4 preconditions.
-
-Notes:
-- This statement is signature-of-intent only and is *not* a GitHub PR approval.  
-- Once this private approval is received, the team will open the formal PR and assign Hermes as reviewer for public approval.
