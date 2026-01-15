@@ -16,6 +16,7 @@ STATE = BASE / "state"
 LOGS = BASE / "logs"
 
 LOG_FILE = LOGS / "ct.log"
+EXEC_MAP = BASE / "execution_map.yaml"
 
 
 def log(msg: str):
@@ -68,7 +69,22 @@ def main():
             try:
                 job = load_yaml(job_file)
 
+                action = job.get("action")
                 component = job.get("target", "ct-core")
+
+                # execution map validation (central policy)
+                exec_map = load_yaml(EXEC_MAP) if EXEC_MAP.exists() else {}
+                if action not in exec_map:
+                    raise Exception(f"unauthorized: action '{action}' not defined in execution map")
+                entry = exec_map.get(action, {}) or {}
+                log(f"ACTION_CHECK {job_id}: action={action} entry={entry}")
+
+                # escalation check
+                if entry.get("escalation_required") and not job.get("approved_by"):
+                    raise Exception(f"unauthorized: action '{action}' requires escalation/approval")
+
+                # action-level allowlist supersedes agent allows
+                action_allowed = entry.get("allow")
 
                 # snapshot last-known-good before execution
                 lg = last_good(component)
