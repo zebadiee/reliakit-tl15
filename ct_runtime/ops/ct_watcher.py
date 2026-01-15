@@ -17,6 +17,7 @@ LOGS = BASE / "logs"
 
 LOG_FILE = LOGS / "ct.log"
 EXEC_MAP = BASE / "execution_map.yaml"
+LESSONS_FILE = BASE / "lessons.yaml"
 
 
 def log(msg: str):
@@ -104,6 +105,16 @@ def main():
                     "executed_by": "hermes",
                     "timestamp": datetime.utcnow().isoformat()
                 }
+
+                # read-only lesson consultation (no enforcement)
+                try:
+                    import yaml as _yaml
+                    lessons = _yaml.safe_load(LESSONS_FILE.read_text()) if LESSONS_FILE.exists() else []
+                    matches = [l for l in lessons if action in l.get('id', '') or action in l.get('rule', '')]
+                    for m in matches:
+                        log(f"LESSON_CHECK {job_id}: matched {m.get('id')}")
+                except Exception:
+                    pass
 
             except Exception as e:
                 recover(component, str(e))
