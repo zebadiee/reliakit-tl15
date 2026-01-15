@@ -1,0 +1,5 @@
+NODE: INVICTUS
+ROLE: AUTHORITY
+SEALED_AT_UTC: 2026-01-13T21:15:00Z
+STATUS: SEALED
+NOTES: ct-core consume-only, lease issuance locked

@@ -1,19 +1,25 @@
-version: "3.9"
-
 services:
   ct-core:
     container_name: ct-core
     image: python:3.11-slim
+
+    environment:
+      CT_DB_SEALED: "${CT_DB_SEALED:-1}"
+
     working_dir: /app
+
     command:
       - sh
       - -c
       - |
         pip install --no-cache-dir fastapi uvicorn &&
-        uvicorn ct_server:app --host 0.0.0.0 --port 7777
+        uvicorn ct_server:app --host 0.0.0.0 --port 7777 --log-level debug
+
     volumes:
       - /home/zebadiee/ct-runtime:/app
-      - /home/zebadiee/invictus/data:/home/zebadiee/invictus/data
+      - /home/zebadiee/invictus/data:/root/invictus/data
+
     ports:
-      - "127.0.0.1:7777:7777"
+      - "7777:7777"
+
     restart: unless-stopped

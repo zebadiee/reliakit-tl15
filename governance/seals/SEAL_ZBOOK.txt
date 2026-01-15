@@ -1,0 +1,5 @@
+NODE: ZBOOK
+ROLE: EXECUTOR
+SEALED_AT_UTC: 2026-01-13T21:15:00Z
+STATUS: SEALED
+NOTES: Guarded executor, fail-closed verified

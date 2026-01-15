@@ -1,0 +1,262 @@
+cd ~/ct-runtime
+cp -a ct_server.py ct_server.py.bak.$(date -u +%Y%m%dT%H%M%SZ)
+
+cat > ct_server.py <<'PY'
+#!/usr/bin/env python3
+import os
+import sqlite3
+import hashlib
+import uuid
+from typing import Optional, Dict, Any, List
+from datetime import datetime, timedelta, timezone
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+
+# =========================================================
+# CONFIG
+# =========================================================
+
+NODE_ID = os.environ.get("CT_NODE_ID", "invictus")
+NODE_ROLE = os.environ.get("CT_NODE_ROLE", "authoritative")
+
+DATA_DIR = os.environ.get("CT_DATA_DIR", "/home/zebadiee/invictus/data")
+DB_PATH = os.environ.get("CT_DB_PATH", os.path.join(DATA_DIR, "ct_memory.db"))
+
+
+def utcnow_iso() -> str:
+    # Always UTC, stable string. Use Z suffix to be unambiguous.
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def db() -> sqlite3.Connection:
+    # check_same_thread=False is safe for FastAPI usage with per-request connections
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+
+def init_db() -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+    d = db()
+    c = d.cursor()
+
+    # --- Core identity ---
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS node_identity (
+        node_id   TEXT PRIMARY KEY,
+        role      TEXT NOT NULL,
+        locked    INTEGER NOT NULL,
+        locked_at TEXT NOT NULL
+    )
+    """)
+
+    # --- Agents ---
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS agents (
+        agent_id   TEXT PRIMARY KEY,
+        role       TEXT NOT NULL,
+        revoked    INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+    )
+    """)
+
+    # --- Leases (minimal, compatible with your existing tier DBs) ---
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS leases (
+        lease_id       TEXT PRIMARY KEY,
+        task_id        TEXT NOT NULL,
+        agent_id       TEXT NOT NULL,
+        scope          TEXT NOT NULL,
+        issued_at      TEXT NOT NULL,
+        expires_at     TEXT NOT NULL,
+        state          TEXT NOT NULL,
+        prev_hash      TEXT,
+        hash           TEXT NOT NULL,
+        mode           TEXT NOT NULL DEFAULT 'exclusive',
+        max_consumers  INTEGER NOT NULL DEFAULT 1
+    )
+    """)
+
+    # Ensure node_identity exists (only if empty)
+    row = c.execute("SELECT node_id, role, locked, locked_at FROM node_identity LIMIT 1").fetchone()
+    if row is None:
+        c.execute(
+            "INSERT INTO node_identity (node_id, role, locked, locked_at) VALUES (?, ?, ?, ?)",
+            (NODE_ID, NODE_ROLE, 1, utcnow_iso())
+        )
+
+    d.commit()
+    d.close()
+
+
+# =========================================================
+# MODELS
+# =========================================================
+
+class AgentHelloRequest(BaseModel):
+    agent_id: str
+    role: str = "readonly"
+
+
+class LeaseRequest(BaseModel):
+    agent_id: str
+    task_id: str
+    scope: str
+    expires_in: int = 600
+    mode: str = "exclusive"
+
+
+# =========================================================
+# APP
+# =========================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/health")
+def health():
+    return {"status": "online", "node": NODE_ID}
+
+
+@app.get("/identity")
+def identity():
+    d = db()
+    c = d.cursor()
+    row = c.execute("SELECT node_id, role, locked, locked_at FROM node_identity LIMIT 1").fetchone()
+    d.close()
+    if row is None:
+        raise HTTPException(status_code=500, detail="node_identity missing")
+    return {"node_id": row[0], "role": row[1], "locked": bool(row[2]), "locked_at": row[3]}
+
+
+@app.post("/agent/hello")
+def agent_hello(req: AgentHelloRequest):
+    # UPSERT so role actually updates and revoked clears
+    d = db()
+    c = d.cursor()
+
+    c.execute("""
+    INSERT INTO agents (agent_id, role, revoked, created_at)
+    VALUES (?, ?, 0, ?)
+    ON CONFLICT(agent_id) DO UPDATE SET
+        role = excluded.role,
+        revoked = 0
+    """, (req.agent_id, req.role, utcnow_iso()))
+
+    d.commit()
+    d.close()
+
+    return {"node": NODE_ID, "agent_role": req.role}
+
+
+@app.post("/lease/request")
+def lease_request(req: LeaseRequest):
+    # Validate agent exists and not revoked
+    d = db()
+    c = d.cursor()
+
+    arow = c.execute(
+        "SELECT role, revoked FROM agents WHERE agent_id = ?",
+        (req.agent_id,)
+    ).fetchone()
+
+    if arow is None:
+        d.close()
+        raise HTTPException(status_code=403, detail="agent invalid/revoked")
+
+    if int(arow[1]) != 0:
+        d.close()
+        raise HTTPException(status_code=403, detail="agent invalid/revoked")
+
+    lease_id = str(uuid.uuid4())
+    now = utcnow_iso()
+    expires_at = (
+        datetime.fromisoformat(now.replace("Z", "+00:00")) +
+        timedelta(seconds=req.expires_in)
+    ).isoformat().replace("+00:00", "Z")
+
+    lease_hash = hashlib.sha256(f"{lease_id}{req.agent_id}{now}".encode("utf-8")).hexdigest()
+
+    c.execute("""
+    INSERT INTO leases (
+        lease_id,
+        task_id,
+        agent_id,
+        scope,
+        issued_at,
+        expires_at,
+        state,
+        prev_hash,
+        hash,
+        mode,
+        max_consumers
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 1)
+    """, (
+        lease_id,
+        req.task_id,
+        req.agent_id,
+        req.scope,
+        now,
+        expires_at,
+        "ISSUED",
+        lease_hash,
+        req.mode
+    ))
+
+    d.commit()
+    d.close()
+
+    return {
+        "lease_id": lease_id,
+        "agent_id": req.agent_id,
+        "task_id": req.task_id,
+        "scope": req.scope,
+        "state": "ISSUED",
+        "issued_at": now,
+        "expires_at": expires_at,
+        "mode": req.mode
+    }
+
+
+@app.get("/leases")
+def leases(limit: int = 50):
+    d = db()
+    c = d.cursor()
+    rows = c.execute("""
+        SELECT lease_id, task_id, agent_id, scope, issued_at, expires_at, state, mode
+        FROM leases
+        ORDER BY issued_at DESC
+        LIMIT ?
+    """, (int(limit),)).fetchall()
+    d.close()
+
+    return [
+        {
+            "lease_id": r[0],
+            "task_id": r[1],
+            "agent_id": r[2],
+            "scope": r[3],
+            "issued_at": r[4],
+            "expires_at": r[5],
+            "state": r[6],
+            "mode": r[7],
+        }
+        for r in rows
+    ]
+
+
+if __name__ == "__main__":
+    # Your docker-compose runs: python ct_server.py
+    # So we must start uvicorn here.
+    import uvicorn
+    uvicorn.run("ct_server:app", host="0.0.0.0", port=7777, log_level="info")
+PY
