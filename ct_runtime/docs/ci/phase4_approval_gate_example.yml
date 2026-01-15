@@ -1,0 +1,27 @@
+# Example: Phase-4 Approval Gate (Documentation only - do NOT enable automatically)
+# This file demonstrates how a CI job could verify Hermes approval before progressing.
+# Implementation detail: use GitHub REST API to inspect PR reviews and ensure Hermes has approved.
+
+# pseudo-YAML for docs only
+phase4_approval_gate:
+  description: "Verify Hermes has publicly approved the PR before running Phase-4 jobs"
+  trigger:
+    branch: adr/addenda/phase4-preconditions
+  check:
+    - name: check-pr-exists
+      action: github-pr-exists
+      params:
+        branch: adr/addenda/phase4-preconditions
+    - name: check-hermes-approval
+      action: github-pr-review-check
+      params:
+        reviewer: Hermes
+        required_state: APPROVED
+  on_pass:
+    - allow: run_phase4_pipeline
+  on_fail:
+    - deny: run_phase4_pipeline
+    - notify: "Phase-4 blocked: Hermes approval required"
+
+# Note: This is an example - do not activate as a workflow without discussion and infra support.
+# See docs/governance/phase_transitions.md for the authoritative trigger.
