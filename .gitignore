@@ -16,3 +16,11 @@ __pycache__/
 .idea/
 .vscode/
 .DS_Store
+<<<<<<< Updated upstream
+=======
+
+# Private / review artifacts
+ct_runtime/docs/**/private/
+.venv/
+ct_runtime/docs/hermes_review/private/
+>>>>>>> Stashed changes
