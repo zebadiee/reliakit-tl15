@@ -31,3 +31,4 @@ Acceptance Checklist (Hermes)
 Notes
 
 - Private approvals are useful for preparing the PR, but do NOT replace the public Approve review requirement.
+- For the authoritative Phase‑4 trigger and an example CI gate, see `docs/governance/phase_transitions.md` and `docs/ci/phase4_approval_gate_example.yml`.
