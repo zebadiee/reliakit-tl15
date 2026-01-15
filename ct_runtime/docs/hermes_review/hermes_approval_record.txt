@@ -1,0 +1,5 @@
+APPROVED_BY=HERMES
+APPROVAL_TYPE=EXPLICIT_TEXT
+SCOPE=ADR-009..ADR-014
+STATEMENT=Reviewed ADR-009..ADR-014; acceptance criteria satisfied. Hermes signs off — proceed to Phase-4 enforcement wiring.
+TIMESTAMP=2026-01-15T15:20:32Z
