@@ -1,0 +1,62 @@
+name: Phase-4 Approval Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  check-phase4-approval:
+    name: Check Phase-4 approval
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Verify Hermes approval is recorded
+        id: verify
+        run: |
+          echo "Checking for Hermes approval artifacts..."
+
+          APPROVAL_RECORD="docs/hermes_review/hermes_approval_record.txt"
+          STATUS_FILE="docs/hermes_review/private/hermes_approval_status.txt"
+
+          ok=false
+
+          if [ -f "$APPROVAL_RECORD" ]; then
+            echo "Found $APPROVAL_RECORD"
+            if grep -qi "Reviewed ADR-009..ADR-014" "$APPROVAL_RECORD" || grep -qi "Reviewed ADR-009..ADR-014" "$APPROVAL_RECORD"; then
+              echo "Approval statement found in $APPROVAL_RECORD"
+              ok=true
+            else
+              echo "Approval record found but statement doesn't match expected approval text."
+            fi
+          fi
+
+          if [ -f "$STATUS_FILE" ]; then
+            echo "Found $STATUS_FILE"
+            if grep -q "STATUS=APPROVED" "$STATUS_FILE"; then
+              echo "STATUS=APPROVED in $STATUS_FILE"
+              ok=true
+            else
+              echo "$STATUS_FILE exists but STATUS is not APPROVED"
+            fi
+          fi
+
+          if [ "$ok" = true ]; then
+            echo "Phase-4 approval detected. Passing gate."
+            exit 0
+          else
+            echo "ERROR: Phase-4 approval not detected.\n" \
+                 "Required: either $APPROVAL_RECORD containing the explicit Hermes approval statement,\n" \
+                 "or $STATUS_FILE with STATUS=APPROVED.\n" \
+                 "Please obtain private Hermes approval and record it per the governance process."
+            exit 1
+          fi
+
+      - name: Success message
+        if: ${{ success() }}
+        run: echo "Phase-4 approval gate passed. Proceeding."
+
+      - name: Failure message
+        if: ${{ failure() }}
+        run: echo "Phase-4 approval gate failed. See job logs for required remediation."
