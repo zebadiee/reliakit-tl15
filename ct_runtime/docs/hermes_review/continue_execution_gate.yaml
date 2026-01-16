@@ -1,0 +1,28 @@
+continue_execution_gate:
+  description: "Gate for advancing to Phase-4 enforcement wiring"
+  branch_required: "adr/addenda/phase4-preconditions"
+  required_files:
+    - "docs/adr/ADR-009-key-management.md"
+    - "docs/adr/ADR-010-time-clock-skew.md"
+    - "docs/adr/ADR-011-revocation-sla.md"
+    - "docs/adr/ADR-012-monotonic-counters.md"
+    - "docs/adr/ADR-013-canonical-serialization.md"
+    - "docs/adr/ADR-014-tamper-evident-audit.md"
+    - "docs/hermes_review/phase4_test_plan.md"
+    - "docs/hermes_review/hermes_signoff_packet.md"
+    - "docs/hermes_review/implementation_pr_checklist.md"
+  required_approver: "Hermes"
+  approval_types:
+    - "PR review approval comment"
+    - "PR merge"
+  on_approval:
+    - "Lock ADR-009..ADR-014 as authoritative"
+    - "Finalize Phase-4 enforcement wiring plan"
+    - "Generate implementation PR checklist mapped to ADRs"
+    - "Prepare Phase-4 enforcement PR(s) with minimal, auditable changes"
+  on_change_request:
+    - "Pause execution"
+    - "Apply only requested modifications to ADR(s) or review docs"
+    - "Resubmit to Hermes for approval"
+  remain_idle_until_approved: true
+  notes: "No new policy or governance changes allowed beyond approved ADRs. All actions are reversible and audited."
