@@ -247,15 +247,29 @@ def init_db():
         )
     """)
 
-    seed = [
-        ("executor", "run_task"),
-        ("executor", "read_models"),
-        ("executor", "emit_events"),
-        ("executor", "manage_resources"),
-        ("writer", "emit_events"),
-        ("admin", "manage_federation"),
-        ("admin", "manage_policy")
-    ]
+    # Orchestrator: intents table (CT-ORCHESTRATOR v1)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS intents (
+        intent_id TEXT PRIMARY KEY,
+        description TEXT NOT NULL,
+        constraints JSON NOT NULL,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        completed_at TEXT,
+        -- CT-ORCHESTRATOR additions
+        state TEXT,
+        narrative TEXT
+    )
+    """)
+
+    # join table linking intents to jobs (loose coupling)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS intent_jobs (
+        intent_id TEXT NOT NULL,
+        job_id TEXT NOT NULL,
+        PRIMARY KEY (intent_id, job_id)
+    )
+    """)
     c.executemany("INSERT OR IGNORE INTO roles_permissions (role, capability) VALUES (?, ?)", seed)
 
     c.execute("SELECT COUNT(*) FROM node_identity")
@@ -266,8 +280,57 @@ def init_db():
     d.close()
 
 
+def ensure_exo_jobs_columns():
+    d = db(); c = d.cursor()
+    try:
+        c.execute("PRAGMA table_info(exo_jobs)")
+        cols = [r[1] for r in c.fetchall()]
+        if 'lease_id' not in cols:
+            c.execute("ALTER TABLE exo_jobs ADD COLUMN lease_id TEXT")
+        if 'task_id' not in cols:
+            c.execute("ALTER TABLE exo_jobs ADD COLUMN task_id TEXT")
+        if 'completed_at' not in cols:
+            c.execute("ALTER TABLE exo_jobs ADD COLUMN completed_at TEXT")
+        if 'receipt' not in cols:
+            c.execute("ALTER TABLE exo_jobs ADD COLUMN receipt TEXT")
+        # Fields required for failover
+        if 'started_at' not in cols:
+            c.execute("ALTER TABLE exo_jobs ADD COLUMN started_at TEXT")
+        if 'attempts' not in cols:
+            c.execute("ALTER TABLE exo_jobs ADD COLUMN attempts INTEGER DEFAULT 0")
+        # Field required for intents
+        if 'intent_id' not in cols:
+            c.execute("ALTER TABLE exo_jobs ADD COLUMN intent_id TEXT")
+        d.commit()
+    except Exception:
+        pass
+    finally:
+        d.close()
+
 if not os.environ.get("CT_DB_SEALED"):
     init_db()
+    ensure_exo_jobs_columns()
+    # ensure agents table has liveness columns for failover
+    def ensure_agents_columns():
+        d = db(); c = d.cursor()
+        try:
+            c.execute("PRAGMA table_info(agents)")
+            cols = [r[1] for r in c.fetchall()]
+            if 'last_seen' not in cols:
+                c.execute("ALTER TABLE agents ADD COLUMN last_seen TEXT")
+            if 'status' not in cols:
+                c.execute("ALTER TABLE agents ADD COLUMN status TEXT DEFAULT 'ONLINE'")
+            d.commit()
+        except Exception:
+            pass
+        finally:
+            d.close()
+    ensure_agents_columns()
+    # ensure failover/orchestrator schema exists for existing DBs
+    try:
+        ensure_failover_schema()
+    except Exception:
+        pass
 
 # =========================================================
 # Middleware
@@ -397,6 +460,20 @@ def require_active_lease(lease_id: str, agent_id: Optional[str] = None):
         if datetime.now(timezone.utc) > exp:
             raise HTTPException(status_code=403, detail="Lease expired")
 
+def require_capability(lease_id: str, capability: str, agent_id: Optional[str] = None):
+    require_active_lease(lease_id, agent_id)
+    d = db(); c = d.cursor()
+    c.execute("SELECT 1 FROM lease_capabilities WHERE lease_id=? AND capability=?", (lease_id, capability))
+    ok = c.fetchone() is not None; d.close()
+    if not ok: raise HTTPException(403, f"missing required capability: {capability}")
+
+def require_resource_access(lease_id: str, res_type: str, res_id: str, perm: str, agent_id: Optional[str] = None):
+    require_active_lease(lease_id, agent_id)
+    d = db(); c = d.cursor()
+    c.execute("SELECT 1 FROM lease_resources WHERE lease_id=? AND resource_type=? AND resource_id=? AND permission=?", (lease_id, res_type, res_id, perm))
+    ok = c.fetchone() is not None; d.close()
+    if not ok: raise HTTPException(403, f"resource access denied: {res_type}:{res_id} [{perm}]")
+
 # Tier 14: Delegation
 # =========================================================
 
@@ -523,7 +600,7 @@ def agent_hello(body: dict):
     d = db()
     c = d.cursor()
     c.execute(
-        "INSERT OR IGNORE INTO agents (agent_id, role, revoked, created_at)",
+        "INSERT OR IGNORE INTO agents (agent_id, role, revoked, created_at) VALUES (?, ?, ?, ?)",
         (agent_id, role, 0, utcnow_iso())
     )
     d.commit()
@@ -534,6 +611,25 @@ def agent_hello(body: dict):
         "agent_role": role,
         "sealed": False
     }
+
+@app.post("/agent/heartbeat")
+def agent_heartbeat(body: dict):
+    """Agent heartbeat to mark liveness for failover decisions.
+
+    Body: { agent_id }
+    """
+    agent_id = body.get("agent_id")
+    if not agent_id:
+        raise HTTPException(400, "agent_id required")
+    d = db(); c = d.cursor()
+
+    # Update existing agent or insert minimal record
+    c.execute("UPDATE agents SET last_seen=?, status='ONLINE' WHERE agent_id=?", (utcnow_iso(), agent_id))
+    if c.rowcount == 0:
+        c.execute("INSERT OR REPLACE INTO agents (agent_id, role, revoked, created_at, last_seen, status) VALUES (?, ?, 0, ?, ?, 'ONLINE')",
+                  (agent_id, 'executor', utcnow_iso(), utcnow_iso()))
+    d.commit(); d.close()
+    return {"status": "OK", "agent_id": agent_id}
 
 @app.post("/admin/register_key")
 def register_key(body: dict):
@@ -674,6 +770,258 @@ def model_call(req: ModelInvoke):
     require_capability(req.lease_id, "run_task", agent_id=req.agent_id)
     require_resource_access(req.lease_id, "model", req.model_id, "invoke", agent_id=req.agent_id)
     return {"status": "success", "model": req.model_id, "response": f"Mock response from {req.model_id}..."}
+
+# =========================================================
+# Task execution endpoints (gated)
+# =========================================================
+class TaskExecute(BaseModel):
+    agent_id: Optional[str] = None
+    lease_id: str
+    task_id: str
+    command: Optional[str] = None
+
+# Helper: pick least-busy worker agent
+def pick_least_busy_worker(exclude_agent: Optional[str] = None) -> Optional[str]:
+    d = db(); c = d.cursor()
+    # let SQLite choose randomly among ties using RANDOM(); restrict to 'executor' role
+    if exclude_agent:
+        c.execute("""
+            SELECT a.agent_id
+            FROM agents a
+            LEFT JOIN (
+                SELECT agent_id, COUNT(*) as cnt
+                FROM exo_jobs
+                WHERE status IN ('ISSUED','RUNNING')
+                GROUP BY agent_id
+            ) j ON a.agent_id = j.agent_id
+            WHERE a.role='executor' AND a.revoked=0 AND a.agent_id != ?
+            ORDER BY COALESCE(j.cnt, 0) ASC, RANDOM()
+            LIMIT 1
+        """, (exclude_agent,))
+    else:
+        c.execute("""
+            SELECT a.agent_id
+            FROM agents a
+            LEFT JOIN (
+                SELECT agent_id, COUNT(*) as cnt
+                FROM exo_jobs
+                WHERE status IN ('ISSUED','RUNNING')
+                GROUP BY agent_id
+            ) j ON a.agent_id = j.agent_id
+            WHERE a.role='executor' AND a.revoked=0
+            ORDER BY COALESCE(j.cnt, 0) ASC, RANDOM()
+            LIMIT 1
+        """)
+    row = c.fetchone(); d.close()
+    return row[0] if row else None
+
+class TaskStatus(BaseModel):
+    job_id: str
+    status: str
+    agent_id: str
+    task_id: Optional[str]
+    issued_at: str
+    expires_at: str
+
+class IntentRequest(BaseModel):
+    description: str
+    job_ids: Optional[List[str]] = None
+
+
+@app.post("/intent")
+def create_intent(body: dict, request: Request):
+    """Create an intent as a semantic wrapper. No scheduling occurs here.
+
+    Body: { description, job_ids: [<job_id>, ...] }
+
+    Access: disallow calls coming from agents with role 'executor' (workers).
+    """
+    description = body.get("description")
+    job_ids = body.get("job_ids") or []
+
+    if not description:
+        raise HTTPException(400, "description required")
+
+    # Guard: if caller provided X-Agent-ID and that agent is a worker (executor), deny
+    caller_agent = request.headers.get("X-Agent-ID")
+    if caller_agent:
+        d = db(); c = d.cursor()
+        c.execute("SELECT role FROM agents WHERE agent_id=?", (caller_agent,))
+        row = c.fetchone()
+        d.close()
+        if row and row[0] == 'executor':
+            raise HTTPException(403, "workers may not create intents")
+
+    intent_id = str(uuid.uuid4())
+    created_at = utcnow_iso()
+    d = db(); c = d.cursor()
+    # set initial state to PENDING and empty narrative
+    c.execute("INSERT INTO intents (intent_id, description, constraints, status, created_at, state, narrative) VALUES (?, ?, ?, ?, ?, ?, ?)",
+              (intent_id, description, json.dumps({}), "CREATED", created_at, 'PENDING', ''))
+    d.commit()
+
+    # immutable event: INTENT_CREATED
+    try:
+        ts = utcnow_iso()
+        c.execute("SELECT hash FROM events ORDER BY id DESC LIMIT 1")
+        prev = c.fetchone(); prev_hash = prev[0] if prev else ""
+        payload = json.dumps({"intent_id": intent_id, "description": description})
+        h = hash_chain(prev_hash, ts, "SYSTEM", "INTENT_CREATED", payload)
+        c.execute("INSERT INTO events (ts, agent_id, type, payload, prev_hash, hash) VALUES (?, ?, ?, ?, ?, ?)", (ts, "SYSTEM", "INTENT_CREATED", payload, prev_hash, h))
+        d.commit()
+    except Exception:
+        pass
+
+    # Attach provided job_ids (if any) but DO NOT change job state
+    attached = []
+    for jid in job_ids:
+        # check job exists
+        c.execute("SELECT 1 FROM exo_jobs WHERE job_id=?", (jid,))
+        if c.fetchone():
+            c.execute("INSERT OR IGNORE INTO intent_jobs (intent_id, job_id) VALUES (?, ?)", (intent_id, jid))
+            # also set exo_jobs.intent_id for convenience
+            c.execute("UPDATE exo_jobs SET intent_id=? WHERE job_id=?", (intent_id, jid))
+            attached.append(jid)
+    d.commit()
+
+    # Append initial narrative
+    append_intent_narrative(intent_id, f"Intent created with {len(attached)} attached jobs")
+
+    d.close()
+    return {"intent_id": intent_id, "attached_jobs": attached}
+
+
+@app.post("/intent/{intent_id}/attach")
+def attach_jobs_to_intent(intent_id: str, body: dict, request: Request):
+    """Attach existing job_ids to an intent. Does not modify job state."""
+    job_ids = body.get("job_ids") or []
+    if not job_ids:
+        raise HTTPException(400, "job_ids required")
+
+    # Guard: disallow worker callers
+    caller_agent = request.headers.get("X-Agent-ID")
+    if caller_agent:
+        d = db(); c = d.cursor()
+        c.execute("SELECT role FROM agents WHERE agent_id=?", (caller_agent,))
+        row = c.fetchone(); d.close()
+        if row and row[0] == 'executor':
+            raise HTTPException(403, "workers may not attach jobs to intents")
+
+    d = db(); c = d.cursor()
+    attached = []
+    for jid in job_ids:
+        c.execute("SELECT 1 FROM exo_jobs WHERE job_id=?", (jid,))
+        if c.fetchone():
+            c.execute("INSERT OR IGNORE INTO intent_jobs (intent_id, job_id) VALUES (?, ?)", (intent_id, jid))
+            c.execute("UPDATE exo_jobs SET intent_id=? WHERE job_id=?", (intent_id, jid))
+            attached.append(jid)
+    d.commit()
+    append_intent_narrative(intent_id, f"Attached {len(attached)} jobs: {attached}")
+    d.close()
+    return {"intent_id": intent_id, "attached_jobs": attached}
+
+
+def issue_job_for_intent(lease_id: str, task_id: str, agent_id: Optional[str], intent_id: str):
+    """Create a job linked to an intent. Returns (job_id, chosen_agent)"""
+    chosen_agent = agent_id
+    if not chosen_agent:
+        chosen_agent = pick_least_busy_worker()
+    job_id = str(uuid.uuid4())
+    issued_at = utcnow_iso()
+    expires_at = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    d = db(); c = d.cursor()
+    c.execute(
+        "INSERT INTO exo_jobs (job_id, agent_id, lease_id, task_id, status, issued_at, expires_at, intent_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (job_id, chosen_agent, lease_id, task_id, "ISSUED", issued_at, expires_at, intent_id)
+    )
+    d.commit()
+
+    # governance + immutable assignment event
+    log_governance_event("Task Issued (intent)", {"job_id": job_id, "agent_id": chosen_agent, "task_id": task_id, "intent_id": intent_id})
+    try:
+        ts = utcnow_iso()
+        c.execute("SELECT hash FROM events ORDER BY id DESC LIMIT 1")
+        prev = c.fetchone(); prev_hash = prev[0] if prev else ""
+        payload = json.dumps({"job_id": job_id, "agent_id": chosen_agent, "lease_id": lease_id, "task_id": task_id, "intent_id": intent_id})
+        h = hash_chain(prev_hash, ts, chosen_agent or "SYSTEM", "TASK_ASSIGN", payload)
+        c.execute("INSERT INTO events (ts, agent_id, type, payload, prev_hash, hash) VALUES (?, ?, ?, ?, ?, ?)", (ts, chosen_agent or "SYSTEM", "TASK_ASSIGN", payload, prev_hash, h))
+        d.commit()
+    except Exception:
+        pass
+    d.close()
+    return job_id, chosen_agent
+
+@app.get("/task/status/{job_id}")
+def task_status(job_id: str):
+    d = db(); c = d.cursor()
+    c.execute("SELECT job_id, agent_id, lease_id, task_id, status, issued_at, expires_at, completed_at, receipt FROM exo_jobs WHERE job_id=?", (job_id,))
+    row = c.fetchone(); d.close()
+    if not row:
+        raise HTTPException(404, "job not found")
+    return {"job_id": row[0], "agent_id": row[1], "lease_id": row[2], "task_id": row[3], "status": row[4], "issued_at": row[5], "expires_at": row[6], "completed_at": row[7], "receipt": row[8]}
+
+# Task runner API: worker polls for next job and reports updates
+@app.get("/task/next")
+def task_next(agent_id: str):
+    """Return a single ISSUED job for the agent and atomically mark it RUNNING."""
+    d = db(); c = d.cursor()
+    c.execute("SELECT job_id, agent_id, lease_id, task_id, status, issued_at, expires_at FROM exo_jobs WHERE status='ISSUED' AND agent_id=? ORDER BY issued_at LIMIT 1", (agent_id,))
+    row = c.fetchone()
+    if not row:
+        d.close(); return JSONResponse(status_code=204, content={})
+    job_id = row[0]
+    started = utcnow_iso()
+    c.execute("UPDATE exo_jobs SET status='RUNNING', started_at=? WHERE job_id=?", (started, job_id))
+    d.commit(); d.close()
+    log_governance_event("Task Running", {"job_id": job_id, "agent_id": agent_id, "started_at": started})
+    return {"job_id": job_id, "agent_id": row[1], "lease_id": row[2], "task_id": row[3], "status": "RUNNING", "issued_at": row[5], "expires_at": row[6], "started_at": started}
+
+@app.post("/task/update")
+def task_update(body: dict):
+    """Worker calls this to update job status (RUNNING -> COMPLETED or FAILED).
+
+    Body: { job_id, agent_id, status, receipt (optional) }
+    """
+    job_id = body.get("job_id"); agent_id = body.get("agent_id"); status = body.get("status"); receipt = body.get("receipt")
+    if not job_id or not agent_id or not status:
+        raise HTTPException(400, "job_id, agent_id, status required")
+
+    d = db(); c = d.cursor()
+    c.execute("SELECT agent_id, lease_id, status FROM exo_jobs WHERE job_id=?", (job_id,))
+    row = c.fetchone()
+    if not row:
+        d.close(); raise HTTPException(404, "job not found")
+    if row[0] != agent_id:
+        d.close(); raise HTTPException(403, "agent mismatch")
+
+    # Update status and set completion metadata
+    completed_at = None
+    if status in ("COMPLETED", "FAILED"):
+        completed_at = utcnow_iso()
+        c.execute("UPDATE exo_jobs SET status=?, completed_at=?, receipt=? WHERE job_id=?", (status, completed_at, receipt, job_id))
+    else:
+        c.execute("UPDATE exo_jobs SET status=?, receipt=? WHERE job_id=?", (status, receipt, job_id))
+    d.commit()
+
+    # Emit a governance event and an audit event (linking lease)
+    lease_id = row[1]
+    log_governance_event("Task %s" % status, {"job_id": job_id, "agent_id": agent_id, "lease_id": lease_id, "receipt": receipt or ""})
+
+    # Append to events ledger for immutable audit with lease linkage
+    try:
+        ts = utcnow_iso()
+        c.execute("SELECT hash FROM events ORDER BY id DESC LIMIT 1")
+        prev = c.fetchone()
+        prev_hash = prev[0] if prev else ""
+        payload = json.dumps({"job_id": job_id, "agent_id": agent_id, "lease_id": lease_id, "status": status, "receipt": receipt})
+        h = hash_chain(prev_hash, ts, agent_id, "TASK_UPDATE", payload)
+        c.execute("INSERT INTO events (ts, agent_id, type, payload, prev_hash, hash) VALUES (?, ?, ?, ?, ?, ?)", (ts, agent_id, "TASK_UPDATE", payload, prev_hash, h))
+        d.commit()
+    except Exception:
+        pass
+
+    d.close()
+    return {"ok": True}
 
 @app.post("/lease/complete")
 def lease_complete(res: LeaseComplete):
@@ -1005,10 +1353,332 @@ async def node_decay_monitor():
             pass
         await asyncio.sleep(10)
 
+async def agent_decay_monitor():
+    """Mark agents STALE when they haven't heartbeat recently."""
+    while True:
+        try:
+            cutoff = datetime.now(timezone.utc) - timedelta(seconds=30)
+            d = sqlite3.connect(DB_PATH); c = d.cursor()
+            c.execute("""
+                UPDATE agents
+                SET status='STALE'
+                WHERE last_seen < ? AND status='ONLINE' AND revoked=0
+            """, (cutoff.isoformat(),))
+            d.commit(); d.close()
+        except Exception:
+            pass
+        await asyncio.sleep(10)
+
+# Failover: single-pass implementation callable from tests
+AGENT_STALE_SECONDS = int(os.environ.get("CT_AGENT_STALE_SECONDS", "30"))
+JOB_RUNNING_TIMEOUT_SECONDS = int(os.environ.get("CT_JOB_RUNNING_TIMEOUT_SECONDS", "60"))
+
+def normalize_agent_roles():
+    """Normalize legacy agent roles to the canonical 'executor' role.
+
+    Idempotent: converts any agent with role 'worker' to 'executor'.
+    """
+    d = db(); c = d.cursor()
+    try:
+        c.execute("UPDATE agents SET role='executor' WHERE role='worker'")
+        d.commit()
+    except Exception:
+        pass
+    finally:
+        d.close()
+
+
+def ensure_failover_schema():
+    """Add any missing columns needed for failover if the DB was not migrated at startup."""
+    d = db(); c = d.cursor()
+    try:
+        c.execute("PRAGMA table_info(exo_jobs)")
+        cols = [r[1] for r in c.fetchall()]
+        if 'started_at' not in cols:
+            c.execute("ALTER TABLE exo_jobs ADD COLUMN started_at TEXT")
+        if 'attempts' not in cols:
+            c.execute("ALTER TABLE exo_jobs ADD COLUMN attempts INTEGER DEFAULT 0")
+        if 'intent_id' not in cols:
+            c.execute("ALTER TABLE exo_jobs ADD COLUMN intent_id TEXT")
+
+        c.execute("PRAGMA table_info(agents)")
+        acols = [r[1] for r in c.fetchall()]
+        if 'last_seen' not in acols:
+            c.execute("ALTER TABLE agents ADD COLUMN last_seen TEXT")
+        if 'status' not in acols:
+            c.execute("ALTER TABLE agents ADD COLUMN status TEXT DEFAULT 'ONLINE'")
+
+        # Ensure intents table exists for existing DBs and has required columns
+        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='intents'")
+        if not c.fetchone():
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS intents (
+                intent_id TEXT PRIMARY KEY,
+                description TEXT NOT NULL,
+                constraints JSON NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                state TEXT,
+                narrative TEXT
+            )
+            """)
+        else:
+            c.execute("PRAGMA table_info(intents)")
+            icol = [r[1] for r in c.fetchall()]
+            if 'state' not in icol:
+                c.execute("ALTER TABLE intents ADD COLUMN state TEXT")
+            if 'narrative' not in icol:
+                c.execute("ALTER TABLE intents ADD COLUMN narrative TEXT")
+
+        # Ensure intent_jobs join table exists
+        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='intent_jobs'")
+        if not c.fetchone():
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS intent_jobs (
+                intent_id TEXT NOT NULL,
+                job_id TEXT NOT NULL,
+                PRIMARY KEY (intent_id, job_id)
+            )
+            """)
+
+        d.commit()
+    except Exception:
+        pass
+    finally:
+        d.close()
+
+
+def failover_once(timeout_seconds: int = JOB_RUNNING_TIMEOUT_SECONDS):
+    """Perform a single pass of failover: reclaim RUNNING jobs that appear stuck/dead and reassign.
+
+    Returns: list of job_ids reassigned
+    """
+    # Ensure schema is present even if migration didn't run at startup
+    ensure_failover_schema()
+
+    reassigned = []
+    now = datetime.now(timezone.utc)
+    d = db(); c = d.cursor()
+    try:
+        c.execute("SELECT job_id, agent_id, started_at FROM exo_jobs WHERE status='RUNNING' AND started_at IS NOT NULL")
+        rows = c.fetchall()
+        for job_id, agent_id, started_at in rows:
+            if not started_at:
+                continue
+            try:
+                started_dt = datetime.fromisoformat(started_at.replace('Z', '+00:00'))
+            except Exception:
+                # malformed timestamp; consider it timed out
+                started_dt = datetime.fromtimestamp(0, tz=timezone.utc)
+
+            age = (now - started_dt).total_seconds()
+            if age < timeout_seconds:
+                continue
+
+            # check agent liveness
+            c.execute("SELECT last_seen, status FROM agents WHERE agent_id=?", (agent_id,))
+            row = c.fetchone()
+            stale = True
+            if row and row[0]:
+                try:
+                    last_dt = datetime.fromisoformat(row[0].replace('Z', '+00:00'))
+                    stale = (now - last_dt).total_seconds() > AGENT_STALE_SECONDS
+                except Exception:
+                    stale = True
+
+            # If agent is stale or job timed out, try to reassign
+            if stale or age >= timeout_seconds:
+                new_agent = pick_least_busy_worker(exclude_agent=agent_id)
+                ts = utcnow_iso()
+                c.execute("SELECT hash FROM events ORDER BY id DESC LIMIT 1")
+                prev = c.fetchone(); prev_hash = prev[0] if prev else ""
+                payload = json.dumps({"job_id": job_id, "from_agent": agent_id, "to_agent": new_agent})
+                h = hash_chain(prev_hash, ts, (new_agent or "SYSTEM"), "TASK_REASSIGN", payload)
+
+                if new_agent:
+                    # reassign to another agent and mark ISSUED
+                    c.execute(
+                        "UPDATE exo_jobs SET agent_id=?, status='ISSUED', started_at=NULL, attempts=COALESCE(attempts,0)+1 WHERE job_id=?",
+                        (new_agent, job_id)
+                    )
+                    c.execute("INSERT INTO events (ts, agent_id, type, payload, prev_hash, hash) VALUES (?, ?, ?, ?, ?, ?)", (ts, new_agent, "TASK_REASSIGN", payload, prev_hash, h))
+                    reassigned.append(job_id)
+                else:
+                    # no eligible worker: clear assignment and mark ISSUED so operator can re-issue
+                    c.execute("UPDATE exo_jobs SET agent_id=NULL, status='ISSUED', started_at=NULL WHERE job_id=?", (job_id,))
+                    c.execute("INSERT INTO events (ts, agent_id, type, payload, prev_hash, hash) VALUES (?, ?, ?, ?, ?, ?)", (ts, "SYSTEM", "TASK_REASSIGN", payload, prev_hash, h))
+                    reassigned.append(job_id)
+
+        d.commit()
+    except Exception:
+        pass
+    finally:
+        d.close()
+    return reassigned
+
+async def failover_sweeper():
+    while True:
+        try:
+            failover_once()
+        except Exception:
+            pass
+        await asyncio.sleep(10)
+
+@app.post("/admin/failover/once")
+def admin_failover_once(request: Request):
+    """Admin endpoint to trigger a single failover pass. Requires admin agent."""
+    agent_id = request.headers.get("X-Agent-ID")
+    if not agent_id:
+        raise HTTPException(403, "X-Agent-ID required")
+    d = db(); c = d.cursor()
+    c.execute("SELECT role FROM agents WHERE agent_id=?", (agent_id,))
+    row = c.fetchone(); d.close()
+    if not row or row[0] != 'admin':
+        raise HTTPException(403, "admin role required")
+
+    reassigned = failover_once()
+    return {"reassigned": reassigned}
+
+
+def append_intent_narrative(intent_id: str, text: str):
+    """Append a narrative line to the intent and write an Obsidian note."""
+    d = db(); c = d.cursor()
+    try:
+        ts = utcnow_iso()
+        note_line = f"{ts} - {text}\n"
+        c.execute("SELECT narrative FROM intents WHERE intent_id=?", (intent_id,))
+        row = c.fetchone()
+        old = row[0] if row and row[0] else ""
+        new = old + note_line
+        c.execute("UPDATE intents SET narrative=? WHERE intent_id=?", (new, intent_id))
+        d.commit()
+        # write to Obsidian intent note
+        try:
+            path = os.path.join(OBSIDIAN_PATH, "SYSTEM", "Intents")
+            os.makedirs(path, exist_ok=True)
+            fname = os.path.join(path, f"intent-{intent_id}.md")
+            # load current intent state/title
+            c.execute("SELECT description, state, created_at, completed_at FROM intents WHERE intent_id=?", (intent_id,))
+            idesc = c.fetchone()
+            desc_str = idesc[0] if idesc else ""
+            state_str = idesc[1] if idesc and idesc[1] else ""
+            created_at = idesc[2] if idesc else ""
+            completed_at = idesc[3] if idesc else ""
+            with open(fname, "w") as f:
+                f.write(f"# Intent: {desc_str}\n\n")
+                f.write(f"Created: {created_at}\n")
+                f.write(f"State: {state_str}\n")
+                if completed_at:
+                    f.write(f"Completed: {completed_at}\n")
+                f.write("\n## Narrative\n\n")
+                f.write(new)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    finally:
+        d.close()
+
+
+def intent_observer_once():
+    """Compute intent states from job states and append narrative. This NEVER mutates jobs."""
+    changed = []
+    d = db(); c = d.cursor()
+    try:
+        c.execute("SELECT intent_id, description, constraints, state FROM intents")
+        intents = c.fetchall()
+        for intent_id, desc, constraints_json, state in intents:
+            # compute counts
+            c.execute("SELECT COUNT(*), SUM(CASE WHEN status='COMPLETED' THEN 1 ELSE 0 END), SUM(CASE WHEN status='FAILED' THEN 1 ELSE 0 END), SUM(CASE WHEN status IN ('ISSUED','RUNNING') THEN 1 ELSE 0 END) FROM exo_jobs WHERE intent_id=?", (intent_id,))
+            total, completed, failed, outstanding = c.fetchone()
+            total = total or 0
+            completed = completed or 0
+            failed = failed or 0
+            outstanding = outstanding or 0
+
+            new_state = state or 'PENDING'
+
+            if total == 0:
+                new_state = 'PENDING'
+            elif completed == total and total > 0:
+                new_state = 'COMPLETED'
+            elif failed > 0 and completed == 0:
+                new_state = 'FAILED'
+            elif failed > 0 and (completed > 0 or outstanding > 0):
+                new_state = 'DEGRADED'
+            elif outstanding > 0:
+                new_state = 'RUNNING'
+
+            if new_state != state:
+                # update state and append narrative and emit event
+                c.execute("UPDATE intents SET state=? WHERE intent_id=?", (new_state, intent_id))
+                append_intent_narrative(intent_id, f"State changed to {new_state}: total={total}, completed={completed}, failed={failed}, outstanding={outstanding}")
+                # ledger event
+                ts = utcnow_iso()
+                c.execute("SELECT hash FROM events ORDER BY id DESC LIMIT 1")
+                prev = c.fetchone(); prev_hash = prev[0] if prev else ""
+                payload = json.dumps({"intent_id": intent_id, "state": new_state, "total": total, "completed": completed, "failed": failed, "outstanding": outstanding})
+                h = hash_chain(prev_hash, ts, "SYSTEM", f"INTENT_{new_state}", payload)
+                c.execute("INSERT INTO events (ts, agent_id, type, payload, prev_hash, hash) VALUES (?, ?, ?, ?, ?, ?)", (ts, "SYSTEM", f"INTENT_{new_state}", payload, prev_hash, h))
+                # set completed_at if moved to COMPLETED or FAILED
+                if new_state in ('COMPLETED', 'FAILED'):
+                    c.execute("UPDATE intents SET completed_at=? WHERE intent_id=?", (utcnow_iso(), intent_id))
+                changed.append(intent_id)
+
+        # Detect TASK_REASSIGN events that affect intents and append narrative
+        c.execute("SELECT id, ts, agent_id, type, payload FROM events WHERE type='TASK_REASSIGN' ORDER BY id DESC LIMIT 50")
+        evs = c.fetchall()
+        for eid, ets, eagent, etype, payload in evs:
+            try:
+                p = json.loads(payload)
+                jid = p.get('job_id')
+                if not jid: continue
+                c.execute("SELECT intent_id FROM exo_jobs WHERE job_id=?", (jid,))
+                r = c.fetchone()
+                if r and r[0]:
+                    intent_id = r[0]
+                    append_intent_narrative(intent_id, f"Recovery: job {jid} reassigned from {p.get('from_agent')} to {p.get('to_agent')}")
+            except Exception:
+                pass
+
+        d.commit()
+    except Exception:
+        pass
+    finally:
+        d.close()
+    return changed
+
+async def intent_observer_sweeper():
+    while True:
+        try:
+            intent_observer_once()
+        except Exception:
+            pass
+        await asyncio.sleep(5)
+
+async def orchestrator_sweeper():
+    while True:
+        try:
+            orchestrator_once()
+        except Exception:
+            pass
+        await asyncio.sleep(5)
+
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(lease_sweeper())
     asyncio.create_task(node_decay_monitor())
+    asyncio.create_task(agent_decay_monitor())
+    asyncio.create_task(failover_sweeper())
+    asyncio.create_task(orchestrator_sweeper())
+    asyncio.create_task(intent_observer_sweeper())
+    # Normalize legacy roles on startup
+    try:
+        normalize_agent_roles()
+    except Exception:
+        pass
+
     # Governance note: Tier 14 is intentionally inactive/guarded until explicitly enabled.
     log_governance_event("Tier 14 Inactive", {"status": "guarded", "note": "delegation disabled"})
 # WRITE TEST Wed Jan 14 01:56:47 PM GMT 2026
