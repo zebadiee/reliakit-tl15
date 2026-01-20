@@ -1,0 +1,9 @@
+agent_id: HADES
+role: executor
+
+capabilities:
+  - execute_task
+  - report_status
+
+heartbeat_interval: 5
+poll_interval: 3
