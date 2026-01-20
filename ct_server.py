@@ -23,13 +23,26 @@ from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
-from fastapi.responses import JSONResponse
+
+# Default role->capability seed used by init_db()
+DEFAULT_ROLE_SEED = [
+    ("executor", "run_task"),
+    ("executor", "read_models"),
+    ("executor", "emit_events"),
+    ("executor", "manage_resources"),
+    ("writer", "emit_events"),
+    ("admin", "manage_federation"),
+    ("admin", "manage_policy"),
+]
+from fastapi.responses import JSONResponse, Response
 
 # =========================================================
 # Core identity
 # =========================================================
 
 NODE_ID = os.environ.get("CT_NODE_ID", "invictus")
+# Startup hard-assertion to ensure this process is the sealed authority
+assert os.environ.get("CT_NODE_ID") == "HERMES", "AUTHORITY VIOLATION"
 NODE_ROLE = os.environ.get("CT_NODE_ROLE", "authoritative")
 
 BASE = os.path.expanduser("~/invictus")
@@ -270,7 +283,7 @@ def init_db():
         PRIMARY KEY (intent_id, job_id)
     )
     """)
-    c.executemany("INSERT OR IGNORE INTO roles_permissions (role, capability) VALUES (?, ?)", seed)
+    c.executemany("INSERT OR IGNORE INTO roles_permissions (role, capability) VALUES (?, ?)", DEFAULT_ROLE_SEED)
 
     c.execute("SELECT COUNT(*) FROM node_identity")
     if c.fetchone()[0] == 0:
@@ -583,34 +596,8 @@ def identity():
     return {"node_id": row[0], "role": row[1], "locked": bool(row[2]), "locked_at": row[3]}
 @app.post("/agent/hello")
 def agent_hello(body: dict):
-    agent_id = body.get("agent_id")
-    role = body.get("role", "executor")
-
-    if not agent_id:
-        raise HTTPException(400, "agent_id required")
-
-    # HARD RULE: sealed means ZERO writes
-    if CT_DB_SEALED:
-        return {
-            "node": NODE_ID,
-            "agent_role": "readonly",
-            "sealed": True
-        }
-
-    d = db()
-    c = d.cursor()
-    c.execute(
-        "INSERT OR IGNORE INTO agents (agent_id, role, revoked, created_at) VALUES (?, ?, ?, ?)",
-        (agent_id, role, 0, utcnow_iso())
-    )
-    d.commit()
-    d.close()
-
-    return {
-        "node": NODE_ID,
-        "agent_role": role,
-        "sealed": False
-    }
+    # Legacy worker handshake removed by ct-contract-v1
+    raise HTTPException(status_code=404, detail="Route removed in ct-contract-v1")
 
 @app.post("/agent/heartbeat")
 def agent_heartbeat(body: dict):
@@ -884,8 +871,8 @@ def create_intent(body: dict, request: Request):
             attached.append(jid)
     d.commit()
 
-    # Append initial narrative
-    append_intent_narrative(intent_id, f"Intent created with {len(attached)} attached jobs")
+    # Append initial narrative and regenerate VOICE (policy: state change -> regen)
+    append_intent_narrative(intent_id, f"Intent created with {len(attached)} attached jobs", regen_voice=True)
 
     d.close()
     return {"intent_id": intent_id, "attached_jobs": attached}
@@ -968,7 +955,8 @@ def task_next(agent_id: str):
     c.execute("SELECT job_id, agent_id, lease_id, task_id, status, issued_at, expires_at FROM exo_jobs WHERE status='ISSUED' AND agent_id=? ORDER BY issued_at LIMIT 1", (agent_id,))
     row = c.fetchone()
     if not row:
-        d.close(); return JSONResponse(status_code=204, content={})
+        d.close()
+        return Response(status_code=204)
     job_id = row[0]
     started = utcnow_iso()
     c.execute("UPDATE exo_jobs SET status='RUNNING', started_at=? WHERE job_id=?", (started, job_id))
@@ -1541,8 +1529,11 @@ def admin_failover_once(request: Request):
     return {"reassigned": reassigned}
 
 
-def append_intent_narrative(intent_id: str, text: str):
-    """Append a narrative line to the intent and write an Obsidian note."""
+def append_intent_narrative(intent_id: str, text: str, regen_voice: bool = False):
+    """Append a narrative line to the intent and write an Obsidian note.
+
+    regen_voice: only regenerate VOICE if True (policy-guarded).
+    """
     d = db(); c = d.cursor()
     try:
         ts = utcnow_iso()
@@ -1573,6 +1564,50 @@ def append_intent_narrative(intent_id: str, text: str):
                     f.write(f"Completed: {completed_at}\n")
                 f.write("\n## Narrative\n\n")
                 f.write(new)
+
+            # Regenerate system VOICE only when allowed by policy
+            if regen_voice:
+                try:
+                    def regenerate_voice():
+                        d2 = db(); c2 = d2.cursor()
+                        try:
+                            c2.execute("SELECT intent_id, description, state, narrative, created_at FROM intents WHERE state IS NOT NULL ORDER BY created_at DESC")
+                            rows = c2.fetchall()
+                            # generate voice paragraphs for active (non-COMPLETED/FAILED) intents
+                            lines = []
+                            active = [r for r in rows if r[2] not in ('COMPLETED', 'FAILED')]
+                            if not active:
+                                lines.append("There are currently no active intents. The system is idle and stable.")
+                            else:
+                                for iid, desc, st, nar, ca in active:
+                                    # pick most recent narrative line if available
+                                    note = "" if not nar else nar.strip().splitlines()[-1]
+                                    para = f"Intent: {desc}\nState: {st}\n{note}"
+                                    lines.append(para)
+                            voice_text = "\n\n".join(lines) + "\n"
+                            # write to OBSIDIAN_PATH and also mirror to ATLAS_lock for baseline
+                            vp = os.path.join(OBSIDIAN_PATH, "SYSTEM")
+                            os.makedirs(vp, exist_ok=True)
+                            with open(os.path.join(vp, "VOICE.md"), "w") as vf:
+                                vf.write("# SYSTEM VOICE\n\n")
+                                vf.write(voice_text)
+                            # mirror to repo-level ATLAS_lock for baseline snapshot
+                            atlas_vp = os.path.join(os.path.dirname(__file__), "ATLAS_lock", "SYSTEM")
+                            os.makedirs(atlas_vp, exist_ok=True)
+                            with open(os.path.join(atlas_vp, "VOICE.md"), "w") as vf2:
+                                vf2.write("# SYSTEM VOICE\n\n")
+                                vf2.write(voice_text)
+                            # metadata
+                            meta = {"generated_at": utcnow_iso(), "generated_by": NODE_ID, "note": "AUTO VOICE snapshot"}
+                            with open(os.path.join(atlas_vp, "VOICE.meta.json"), "w") as mf:
+                                mf.write(json.dumps(meta, indent=2))
+                        except Exception:
+                            pass
+                        finally:
+                            d2.close()
+                    regenerate_voice()
+                except Exception:
+                    pass
         except Exception:
             pass
     except Exception:
@@ -1613,7 +1648,7 @@ def intent_observer_once():
             if new_state != state:
                 # update state and append narrative and emit event
                 c.execute("UPDATE intents SET state=? WHERE intent_id=?", (new_state, intent_id))
-                append_intent_narrative(intent_id, f"State changed to {new_state}: total={total}, completed={completed}, failed={failed}, outstanding={outstanding}")
+                append_intent_narrative(intent_id, f"State changed to {new_state}: total={total}, completed={completed}, failed={failed}, outstanding={outstanding}", regen_voice=True)
                 # ledger event
                 ts = utcnow_iso()
                 c.execute("SELECT hash FROM events ORDER BY id DESC LIMIT 1")
@@ -1638,7 +1673,7 @@ def intent_observer_once():
                 r = c.fetchone()
                 if r and r[0]:
                     intent_id = r[0]
-                    append_intent_narrative(intent_id, f"Recovery: job {jid} reassigned from {p.get('from_agent')} to {p.get('to_agent')}")
+                    append_intent_narrative(intent_id, f"Recovery: job {jid} reassigned from {p.get('from_agent')} to {p.get('to_agent')}", regen_voice=True)
             except Exception:
                 pass
 
