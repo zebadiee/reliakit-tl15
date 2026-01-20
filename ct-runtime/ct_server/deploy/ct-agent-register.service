@@ -1,0 +1,16 @@
+[Unit]
+Description=CT Agent Register
+After=network.target
+
+[Service]
+Type=simple
+User=ct
+Group=ct
+EnvironmentFile=/etc/ct-agent/ct-agent-register.env
+WorkingDirectory=${CT_RUNTIME_DIR:-/var/lib/ct-runtime}
+ExecStart=/bin/sh -lc 'cd ${CT_RUNTIME_DIR:-/var/lib/ct-runtime} && ${CT_RUNTIME_VENV:-/usr/bin/uvicorn} ct_server:app --host ${CT_AGENT_HOST:-127.0.0.1} --port ${CT_AGENT_PORT:-7778}'
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

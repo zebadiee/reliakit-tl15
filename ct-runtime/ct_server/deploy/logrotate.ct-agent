@@ -1,0 +1,9 @@
+/var/log/ct-agent/*.log {
+    daily
+    rotate 7
+    missingok
+    notifempty
+    compress
+    copytruncate
+    create 0640 ct ct
+}
