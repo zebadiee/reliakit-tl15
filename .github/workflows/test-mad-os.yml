@@ -1,0 +1,21 @@
+name: MAD-OS CI - tests
+
+on:
+  pull_request:
+    paths:
+      - 'mad_os/**'
+      - 'tests/**'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Install test deps
+        run: python -m pip install --upgrade pip && pip install pytest
+      - name: Run tests
+        run: pytest -q
