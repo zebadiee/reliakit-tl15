@@ -5,6 +5,7 @@ on:
     paths:
       - 'mad_os/**'
       - 'tests/**'
+      - 'scripts/**'
 
 jobs:
   test:
