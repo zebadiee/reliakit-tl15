@@ -32,6 +32,10 @@ if os.environ.get("CT_ROLE") == "admin":
 DATA_DIR = os.environ.get("CT_DATA", os.path.expanduser("~/invictus/data"))
 # Allow systemd to provide a read-only DB copy for sandboxed service
 DB_PATH = os.environ.get("CT_MACHINE_DB", os.path.join(DATA_DIR, "ct_memory.db"))
+# Clear, deterministic startup info for verification
+print(f"MODE={os.environ.get('CT_MODE')}", file=sys.stderr)
+print(f"DB={DB_PATH}", file=sys.stderr)
+print("NO_WRITES=TRUE", file=sys.stderr)
 ATLAS_PATHS = ["/srv/ct/atlas", "/home/zebadiee/ct-runtime/ATLAS_lock"]
 STATE_PATH = "/run/ct/machine.state"
 CT_VERSION = os.environ.get("CT_VERSION", "unknown")
