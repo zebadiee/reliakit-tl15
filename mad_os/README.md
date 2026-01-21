@@ -1,0 +1,1 @@
+MAD-OS is a modular operating blueprint and contract layer that governs how independent reasoning engines are discovered, constrained, assembled, explained, and observed — without owning domain logic or enforcement.
