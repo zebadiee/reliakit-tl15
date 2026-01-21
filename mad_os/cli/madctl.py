@@ -141,10 +141,33 @@ mode=READ_ONLY
 
         summary[name] = status
 
+    # write audit entry (JSONL) under root/.mad_os/AUDIT.log — append only
+    try:
+        audit_entry = {
+            "ts": timestamp,
+            "actor": "madctl",
+            "action": "pull.repos",
+            "mode": resolve_mode(os.environ).value,
+            "repos": [
+                {"url": s.get("repo"), "path": s.get("dest"), "commit": s.get("commit")} for s in summary.values()
+            ],
+            "root": str(root),
+        }
+        import hashlib
+        payload = json.dumps(audit_entry, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        audit_entry["sha"] = hashlib.sha256(payload).hexdigest()
+        audit_log = Path(root) / ".mad_os" / "AUDIT.log"
+        audit_log.parent.mkdir(parents=True, exist_ok=True)
+        with audit_log.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(audit_entry, sort_keys=True) + "\n")
+        status_audit = True
+    except Exception:
+        status_audit = False
+
     if as_json:
         print(json.dumps(summary, indent=2, sort_keys=True))
 
-    return Result(True, {"summary": summary})
+    return Result(True, {"summary": summary, "audit_written": status_audit})
 
 
 # ---- CLI wiring --------------------------------------------------------------
@@ -183,6 +206,7 @@ def build_parser() -> argparse.ArgumentParser:
     repos.add_argument("--repo", dest="repos", action="append", default=[], help="Repository URL (repeatable)")
     repos.add_argument("--file", dest="file", help="File with repo URLs, one per line")
     repos.add_argument("--root", dest="root", default=str(Path(os.environ.get("HOME", "~")) / "mad-os-research"), help="Root dir to store repos")
+    repos.add_argument("--json", action="store_true", help="JSON output for pull results")
 
     return p
 

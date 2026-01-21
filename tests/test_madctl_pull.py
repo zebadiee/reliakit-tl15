@@ -45,6 +45,17 @@ def test_pull_repos_initial_commit():
         txt1 = d1.read_text()
         assert "commit=" in txt1
 
+        # audit log should exist and include this operation
+        audit = Path(rootdir) / ".mad_os" / "AUDIT.log"
+        assert audit.exists()
+        import json
+        lines = audit.read_text().splitlines()
+        assert len(lines) >= 1
+        entry = json.loads(lines[-1])
+        assert entry["action"] == "pull.repos"
+        assert entry["root"] == rootdir
+        assert any(r.get("url") == url1 and r.get("commit") for r in entry["repos"])
+
 
 def test_pull_repos_update_commit():
     with tempfile.TemporaryDirectory() as srcdir, tempfile.TemporaryDirectory() as rootdir:
@@ -69,3 +80,20 @@ def test_pull_repos_update_commit():
         assert res2.returncode == 0
         after = snap.read_text()
         assert before != after
+
+        # audit should reflect the updated commit for the repo
+        audit = Path(rootdir) / ".mad_os" / "AUDIT.log"
+        assert audit.exists()
+        import json
+        lines = audit.read_text().splitlines()
+        assert len(lines) >= 1
+        entry = json.loads(lines[-1])
+        # extract commit from snapshot
+        commit_after = None
+        for line in after.splitlines():
+            if line.startswith("commit="):
+                commit_after = line.split("=", 1)[1].strip()
+        assert commit_after
+        repo_entry = next((r for r in entry["repos"] if r.get("url") == url1), None)
+        assert repo_entry is not None
+        assert repo_entry.get("commit") == commit_after
