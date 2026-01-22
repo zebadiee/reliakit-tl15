@@ -1,0 +1,14 @@
+[Unit]
+Description=CT Boot Observer (snag sweep + READY verdict)
+DefaultDependencies=no
+Before=docker.service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ct --mode boot-observer
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
